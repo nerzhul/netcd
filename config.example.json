@@ -1,0 +1,14 @@
+{
+  "server_max_ttl_seconds": 86400,
+  "max_cache_bytes": 268435456,
+  "history_capacity": 1000,
+  "tenants": [
+    {
+      "name": "team-a-apiserver",
+      "allowed_prefixes": [
+        "/registry/events/team-a/"
+      ],
+      "client_cert_fingerprint_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

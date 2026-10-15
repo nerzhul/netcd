@@ -1,0 +1,93 @@
+[package]
+name = "netcd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Single-node etcd v3-compatible in-memory KV store for Kubernetes Event hosting"
+license = "Apache-2.0"
+
+[[bin]]
+name = "netcd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1.42", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+    "fs",
+] }
+tonic = { version = "0.13", features = ["gzip", "transport", "tls-aws-lc", "server"] }
+prost = "0.13"
+prost-types = "0.13"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# TLS - use tonic's bundled rustls (avoids extra feature churn)
+rustls = { version = "0.23", default-features = false, features = [
+    "std",
+    "logging",
+    "tls12",
+    "aws_lc_rs",
+] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
+rustls-pki-types = "1.10"
+
+# Concurrency primitives
+parking_lot = "0.12"
+arc-swap = "1.7"
+
+# Serde / config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Misc
+bytes = "1.8"
+sha2 = "0.10"
+hex = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+anyhow = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+futures = "0.3"
+rand = "0.8"
+
+# Admin HTTP API
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+http = "1.1"
+http-body-util = "0.1"
+
+[dev-dependencies]
+tonic = { version = "0.13", features = ["transport", "tls-aws-lc", "gzip"] }
+rcgen = "0.13"
+tempfile = "3.13"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = "0.5"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+base64 = "0.22"
+arc-swap = "1.7"
+
+[build-dependencies]
+tonic-build = { version = "0.13", features = ["prost"] }
+prost-build = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 0
+debug = 1
