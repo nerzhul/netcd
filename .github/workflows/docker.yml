@@ -1,19 +1,18 @@
-# Publish multi-arch Docker images on every semver tag push.
+# Publish multi-arch Docker images to GitHub Container Registry on every
+# semver tag push.
 #
 # Triggers:
 #   * Tag push matching vX.Y.Z or vX.Y.Z-* (pre-release)
 #   * Manual dispatch from the Actions UI
 #
-# Images are pushed to both registries when the corresponding secrets exist:
-#   * ghcr.io/<owner>/netcd                          (always, uses GITHUB_TOKEN)
-#   * docker.io/<DOCKERHUB_USERNAME>/netcd           (when DOCKERHUB_USERNAME
-#                                                    and DOCKERHUB_TOKEN secrets
-#                                                    are configured)
+# Images are pushed to:
+#   * ghcr.io/<owner>/netcd                          (uses GITHUB_TOKEN,
+#                                                    needs the `packages: write`
+#                                                    permission granted below)
 #
-# Tags produced (per registry): the exact semver `1.2.3`, the `1.2` and `1`
-# rolling tags, plus a short git SHA. The `latest` tag is only applied on a
-# manual dispatch from the default branch (so a tag push never silently
-# promotes to latest).
+# Tags produced: the exact semver `1.2.3`, the `1.2` and `1` rolling tags,
+# plus a short git SHA. The `latest` tag is only applied on a manual dispatch
+# from the default branch (so a tag push never silently promotes to latest).
 
 name: release-docker
 
@@ -49,23 +48,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Optional: only runs when both Docker Hub secrets are configured in
-      # the repository settings. Without them the build still succeeds and
-      # only the GHCR image is published.
-      - name: Log in to Docker Hub
-        if: secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != ''
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            ghcr.io/${{ github.repository_owner }}/netcd
-            ${{ secrets.DOCKERHUB_USERNAME != '' && format('{0}/netcd', secrets.DOCKERHUB_USERNAME) || '' }}
+          images: ghcr.io/${{ github.repository_owner }}/netcd
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
