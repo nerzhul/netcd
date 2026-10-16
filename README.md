@@ -60,6 +60,20 @@ netcd \
 
 ### Run in Docker
 
+#### Pre-built images
+
+Tagged releases are published automatically by the
+[`release-docker`](.github/workflows/docker.yml) workflow to:
+
+- `ghcr.io/<owner>/netcd:<tag>` (e.g. `ghcr.io/nerzhul/netcd:v1.2.3`)
+- `docker.io/<owner>/netcd:<tag>` when the `DOCKERHUB_USERNAME` and
+  `DOCKERHUB_TOKEN` secrets are configured.
+
+Each semver tag `vX.Y.Z` produces the rolling tags `X.Y.Z`, `X.Y`, and `X`,
+plus a short git SHA. `latest` is reserved for the default branch.
+
+#### Local build
+
 ```bash
 docker build -t netcd:dev .
 docker run --rm -p 2379:2379 -p 2378:2378 \
