@@ -179,6 +179,11 @@ struct Stats {
     lease_count: usize,
     watch_count: usize,
     compacted_rev: u64,
+    /// Oldest revision still held in the in-memory history ring
+    /// buffer (0 if empty). Any `start_revision <= compacted_rev` is
+    /// considered compacted and will be answered with a
+    /// `WatchResponse{compact_revision}` notification.
+    oldest_rev: u64,
 }
 
 async fn get_stats(State(s): State<AdminState>) -> Json<Stats> {
@@ -193,6 +198,7 @@ async fn get_stats(State(s): State<AdminState>) -> Json<Stats> {
         lease_count: leases.len(),
         watch_count: watches.len(),
         compacted_rev: s.store.compacted_rev.load(Ordering::Relaxed),
+        oldest_rev: s.store.history.oldest_rev(),
     })
 }
 

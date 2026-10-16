@@ -169,7 +169,9 @@ impl Store {
             self.leases.attach(lid, key.clone());
         }
 
-        // Record in history.
+        // Record in history. If the FIFO ring buffer just dropped an
+        // older entry, advance `compacted_rev` so watchers can detect
+        // that their cached `start_revision` is no longer reachable.
         let m = Mutation {
             rev: new_rev,
             kind: MutationKind::Put,
@@ -178,7 +180,9 @@ impl Store {
             create_rev,
             lease_id,
         };
-        self.history.push(m.clone());
+        if let Some(dropped) = self.history.push(m.clone()) {
+            self.compacted_rev.fetch_max(dropped, Ordering::Relaxed);
+        }
 
         // Evict opportunistically.
         self.evict_to_capacity();
@@ -229,7 +233,9 @@ impl Store {
             create_rev: entry.create_rev,
             lease_id: entry.lease_id,
         };
-        self.history.push(m.clone());
+        if let Some(dropped) = self.history.push(m.clone()) {
+            self.compacted_rev.fetch_max(dropped, Ordering::Relaxed);
+        }
         self.fanout(m);
         Ok((new_rev, 1))
     }
@@ -363,7 +369,9 @@ impl Store {
                     create_rev: e.create_rev,
                     lease_id: e.lease_id,
                 };
-                self.history.push(m.clone());
+                if let Some(dropped) = self.history.push(m.clone()) {
+                    self.compacted_rev.fetch_max(dropped, Ordering::Relaxed);
+                }
                 self.fanout(m);
                 tracing::debug!(key = ?front.key, "evicted by capacity");
             }
@@ -474,6 +482,69 @@ mod tests {
         assert!(keys.contains(&b"/foo/a".as_slice()));
         assert!(keys.contains(&b"/foo/b".as_slice()));
         assert!(keys.contains(&b"/foo/c".as_slice()));
+    }
+
+    #[test]
+    fn fifo_drop_advances_compacted_rev() {
+        // Regression: the history ring buffer used to drop oldest
+        // entries silently while leaving `compacted_rev` at 0, so
+        // watchers with `start_revision` below `oldest_rev` got a
+        // partial replay and no compact notification. The fix is to
+        // bump `compacted_rev` to the dropped rev on every eviction.
+        let s = Store::new(1024, 3);
+        s.put(Bytes::from_static(b"a"), Bytes::from_static(b"1"), None)
+            .unwrap();
+        s.put(Bytes::from_static(b"b"), Bytes::from_static(b"2"), None)
+            .unwrap();
+        s.put(Bytes::from_static(b"c"), Bytes::from_static(b"3"), None)
+            .unwrap();
+        // Buffer is now [a=rev2, b=rev3, c=rev4] (rev 1 is reserved
+        // and never goes into history). compacted_rev is still 0.
+        assert_eq!(s.compacted_rev.load(Ordering::Relaxed), 0);
+
+        // One more Put evicts rev 2 (the oldest history entry).
+        s.put(Bytes::from_static(b"d"), Bytes::from_static(b"4"), None)
+            .unwrap();
+        assert_eq!(
+            s.compacted_rev.load(Ordering::Relaxed),
+            2,
+            "FIFO drop must bump compacted_rev to the evicted rev",
+        );
+
+        // Another Put evicts rev 3.
+        s.put(Bytes::from_static(b"e"), Bytes::from_static(b"5"), None)
+            .unwrap();
+        assert_eq!(
+            s.compacted_rev.load(Ordering::Relaxed),
+            3,
+            "compacted_rev must keep up with successive evictions",
+        );
+    }
+
+    #[test]
+    fn explicit_compact_is_not_lowered_by_fifo_drop() {
+        // The fix uses `fetch_max` on compacted_rev so an explicit
+        // Compact(50) call is not erased by a later FIFO drop of a
+        // younger rev.
+        let s = Store::new(1024, 2);
+        for i in 0..10u32 {
+            s.put(
+                Bytes::from(format!("/k/{i}")),
+                Bytes::from_static(b"v"),
+                None,
+            )
+            .unwrap();
+        }
+        s.compacted_rev.store(50, Ordering::Relaxed);
+        // One more Put drops the oldest, which has rev <= 10. The
+        // fetch_max must keep compacted_rev at 50.
+        s.put(Bytes::from_static(b"/k/x"), Bytes::from_static(b"v"), None)
+            .unwrap();
+        assert_eq!(
+            s.compacted_rev.load(Ordering::Relaxed),
+            50,
+            "FIFO drop must not lower an explicit Compact() watermark",
+        );
     }
 
     #[test]

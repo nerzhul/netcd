@@ -207,7 +207,8 @@ curl http://localhost:2378/v1/stats | jq
   "key_count": 17,
   "lease_count": 3,
   "watch_count": 1,
-  "compacted_rev": 0
+  "compacted_rev": 0,
+  "oldest_rev": 38
 }
 ```
 
@@ -221,7 +222,15 @@ Fields:
 | `key_count`       | usize   | Number of live keys (after FIFO eviction).             |
 | `lease_count`     | usize   | Number of active (non-expired) leases.                 |
 | `watch_count`     | usize   | Number of currently-attached Watch streams.            |
-| `compacted_rev`   | u64     | Last successful `Compact` rev; no history is pruned.   |
+| `compacted_rev`   | u64     | Highest revision known to be gone (explicit `Compact`  |
+|                   |         | call or FIFO eviction of the history ring buffer).     |
+|                   |         | A `Watch` with `start_revision <= compacted_rev` is    |
+|                   |         | answered with a one-shot `compact_revision` notification. |
+| `oldest_rev`      | u64     | Oldest revision still held in the history ring buffer  |
+|                   |         | (0 if empty). Watch requests with `start_revision`     |
+|                   |         | older than this are collapsed into the `compacted_rev` |
+|                   |         | path. Exposed for ops/debug only; not part of the      |
+|                   |         | etcd wire protocol.                                    |
 
 ## Examples
 

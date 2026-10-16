@@ -479,3 +479,277 @@ async fn txn_conditional_put() {
     assert_eq!(r.into_inner().kvs[0].value, b"v1");
     h.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Non-regression tests for the watch service.
+//
+// Background: the kube-apiserver logs
+//     "Timeout: Too large resource version: <requested>, current: <current>"
+// whenever netcd accepts a watch request whose `start_revision` is greater
+// than `current_rev` but does NOT return an error. Etcd returns
+// `Status::out_of_range("Too large resource version: %d, current: %d")`
+// from the Watch RPC in that case, and the apiserver treats it as a fatal
+// watch error that triggers a re-List (see
+// k8s.io/apiserver/pkg/storage/etcd3/watcher.go).
+//
+// A second class of bug was the ring buffer silently dropping old
+// revisions while leaving `compacted_rev = 0`, so watchers with a
+// `start_revision` below `oldest_rev` got a partial replay and no
+// `compact_revision` notification.
+
+#[tokio::test]
+async fn watch_future_start_revision_is_accepted_silently() {
+    // Regression: netcd was running, apiserver cached RV=117 from a
+    // List, netcd was restarted (rev resets to 1), and the apiserver
+    // tries to resume its watch at start_revision=117 while netcd is
+    // at rev=56. The server must accept the watch (returning a
+    // `created` response with header.revision = current_rev) and not
+    // stream any past events (none exist below start_revision). Live
+    // mutations after the watch is established are streamed
+    // normally.
+    //
+    // Note: this deviates from etcd, which would return
+    // `OutOfRange("Too large resource version: ...")`. Returning
+    // OutOfRange forces the apiserver's per-resource watchers to
+    // re-List in parallel, producing a burst of N `watcher.go:425
+    // watch chan error` lines in the apiserver log. Since netcd is
+    // in-memory and restarts drop state, this would happen on every
+    // netcd restart, so we accept the watch silently instead. The
+    // apiserver's last List response is still the source of truth
+    // for the current state.
+    let h = Harness::start().await;
+    let mut kv = h.kv_client().await;
+    kv.put(PutRequest {
+        key: b"/registry/events/team-a/seed".to_vec(),
+        value: b"v".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    for i in 0..54u32 {
+        kv.put(PutRequest {
+            key: format!("/registry/events/team-a/pad-{i}")
+                .as_bytes()
+                .to_vec(),
+            value: b"v".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    // Sanity: current_rev is 56 now (1 reserved + 1 seed + 54 pad).
+    let sanity = kv
+        .range(RangeRequest {
+            key: b"/registry/events/team-a/seed".to_vec(),
+            range_end: vec![],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .header
+        .expect("header")
+        .revision as u64;
+    assert_eq!(sanity, 56, "setup: expected current_rev=56");
+
+    // Ask for a start_revision in the future. The server must accept
+    // the watch and return `created=true` with header.revision =
+    // current_rev. It must NOT return OutOfRange.
+    let mut w = h.watch_client().await;
+    let (tx, rx) = futures::channel::mpsc::unbounded::<WatchRequest>();
+    tx.unbounded_send(WatchRequest {
+        request_union: Some(
+            netcd::proto::etcdserverpb::watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"/registry/events/team-a/".to_vec(),
+                    range_end: b"\x00".to_vec(),
+                    start_revision: 117,
+                    ..Default::default()
+                },
+            ),
+        ),
+    })
+    .unwrap();
+    // Keep the request stream open so the watch stays registered.
+    std::mem::forget(tx);
+
+    let mut stream = w.watch(rx).await.expect("watch handshake").into_inner();
+
+    // The first response must be the "created" notification with
+    // header.revision = current_rev (56), NOT start_revision (117)
+    // and NOT an OutOfRange error.
+    let first = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut got: Option<netcd::proto::etcdserverpb::WatchResponse> = None;
+        while got.is_none() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out waiting for first watch response");
+            }
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(resp))) => got = Some(resp),
+                Ok(Some(Err(status))) => panic!(
+                    "watch with start_revision > current_rev must not error, \
+                     got code={:?} message={:?}",
+                    status.code(),
+                    status.message()
+                ),
+                Ok(None) => panic!("watch stream closed before sending the created response"),
+                Err(_) => panic!("timed out waiting for first watch response"),
+            }
+        }
+        got.unwrap()
+    };
+    assert!(first.created, "server must emit a `created` response");
+    assert_eq!(
+        first.header.expect("header").revision,
+        56,
+        "header.revision must be current_rev (56), not the requested start_revision (117)"
+    );
+    assert!(
+        first.events.is_empty(),
+        "no events should be replayed for a start_revision in the future; got {} events",
+        first.events.len()
+    );
+    assert_eq!(
+        first.compact_revision, 0,
+        "no compact notification should be sent for a future start_revision"
+    );
+
+    // The watch is registered for live events. A Put after the
+    // watch is established must be streamed.
+    kv.put(PutRequest {
+        key: b"/registry/events/team-a/late".to_vec(),
+        value: b"after-watch".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut got_live = false;
+    while !got_live {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            panic!("did not receive the live Put event after accepting the future watch");
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(resp))) => {
+                if !resp.events.is_empty() {
+                    got_live = true;
+                }
+            }
+            Ok(Some(Err(status))) => panic!(
+                "unexpected error after live Put: code={:?} message={:?}",
+                status.code(),
+                status.message()
+            ),
+            Ok(None) => panic!("watch stream closed unexpectedly after live Put"),
+            Err(_) => panic!("timed out waiting for live Put event"),
+        }
+    }
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn watch_below_oldest_history_returns_compact_notification() {
+    // Regression: netcd with a small history_capacity lets the ring
+    // buffer cycle past the apiserver's cached start_revision. The
+    // server must advertise `compact_revision` so the apiserver
+    // re-List at the right rev; it must NOT silently stream a
+    // partial view of state.
+    let h = Harness::start().await;
+    let mut kv = h.kv_client().await;
+    // The harness uses history_capacity=100. Drive 200 Puts so the
+    // ring buffer cycles 100 entries.
+    for i in 0..200u32 {
+        kv.put(PutRequest {
+            key: format!("/registry/events/team-a/k-{i:04}")
+                .as_bytes()
+                .to_vec(),
+            value: b"v".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+    let cur = kv
+        .range(RangeRequest {
+            key: b"/registry/events/team-a/seed".to_vec(),
+            range_end: vec![],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .header
+        .expect("header")
+        .revision as u64;
+    assert!(cur >= 200, "setup: expected current_rev >= 200, got {cur}");
+
+    // Ask for a start_revision below oldest_rev (rev 1).
+    let mut w = h.watch_client().await;
+    let (tx, rx) = futures::channel::mpsc::unbounded::<WatchRequest>();
+    tx.unbounded_send(WatchRequest {
+        request_union: Some(
+            netcd::proto::etcdserverpb::watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"/registry/events/team-a/".to_vec(),
+                    range_end: b"\x00".to_vec(),
+                    start_revision: 1,
+                    ..Default::default()
+                },
+            ),
+        ),
+    })
+    .unwrap();
+
+    let mut stream = w.watch(rx).await.expect("watch handshake").into_inner();
+
+    // The first response must be a one-shot compact notification.
+    // Per etcd semantics, no events are streamed and the stream is
+    // left open for future events; we only assert on the first frame
+    // here.
+    let first = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut got: Option<netcd::proto::etcdserverpb::WatchResponse> = None;
+        while got.is_none() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out waiting for first watch response");
+            }
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(resp))) => got = Some(resp),
+                Ok(Some(Err(status))) => panic!(
+                    "unexpected error on compacted watch: code={:?} message={:?}",
+                    status.code(),
+                    status.message()
+                ),
+                Ok(None) => panic!("watch stream closed before sending any response"),
+                Err(_) => panic!("timed out waiting for first watch response"),
+            }
+        }
+        got.unwrap()
+    };
+    assert!(
+        first.events.is_empty() && !first.created,
+        "expected a one-shot compact notification, got created={} events={}",
+        first.created,
+        first.events.len()
+    );
+    assert!(
+        first.compact_revision > 0,
+        "expected compact_revision > 0, got {}",
+        first.compact_revision
+    );
+    // compacted_rev must reflect the dropped revs (>= oldest_rev - 1
+    // after the fix). It must be strictly less than current_rev.
+    let compact = first.compact_revision as u64;
+    assert!(
+        compact < cur,
+        "compact_revision ({compact}) must be < current_rev ({cur})",
+    );
+
+    h.stop().await;
+}

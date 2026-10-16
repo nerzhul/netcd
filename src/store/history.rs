@@ -61,12 +61,15 @@ impl HistoryBuffer {
     }
 
     /// Append a mutation. Drops the oldest if the buffer is full.
-    pub fn push(&self, m: Mutation) {
+    pub fn push(&self, m: Mutation) -> Option<u64> {
         let mut g = self.inner.lock();
-        if g.deque.len() == g.capacity {
-            g.deque.pop_front();
-        }
+        let dropped = if g.deque.len() == g.capacity {
+            g.deque.pop_front().map(|m| m.rev)
+        } else {
+            None
+        };
         g.deque.push_back(m);
+        dropped
     }
 
     /// Snapshot the current buffer. The result is a `Vec<Mutation>`
@@ -128,5 +131,60 @@ mod tests {
         let snap = h.snapshot();
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].rev, 4);
+    }
+
+    #[test]
+    fn push_returns_dropped_rev() {
+        // The `Store` uses this return value to bump `compacted_rev`
+        // so watchers can detect a revision they cached is no longer
+        // reachable.
+        let h = HistoryBuffer::new(2);
+        assert_eq!(
+            h.push(Mutation {
+                rev: 1,
+                kind: MutationKind::Put,
+                key: Bytes::from_static(b"k"),
+                value: Bytes::new(),
+                create_rev: 1,
+                lease_id: None,
+            }),
+            None,
+            "no drop on first push into empty buffer",
+        );
+        assert_eq!(
+            h.push(Mutation {
+                rev: 2,
+                kind: MutationKind::Put,
+                key: Bytes::from_static(b"k"),
+                value: Bytes::new(),
+                create_rev: 2,
+                lease_id: None,
+            }),
+            None,
+            "no drop on push that fills the buffer exactly",
+        );
+        assert_eq!(
+            h.push(Mutation {
+                rev: 3,
+                kind: MutationKind::Put,
+                key: Bytes::from_static(b"k"),
+                value: Bytes::new(),
+                create_rev: 3,
+                lease_id: None,
+            }),
+            Some(1),
+            "drop returns the oldest rev that was just evicted",
+        );
+        assert_eq!(
+            h.push(Mutation {
+                rev: 4,
+                kind: MutationKind::Put,
+                key: Bytes::from_static(b"k"),
+                value: Bytes::new(),
+                create_rev: 4,
+                lease_id: None,
+            }),
+            Some(2),
+        );
     }
 }

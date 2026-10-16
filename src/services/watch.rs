@@ -148,6 +148,50 @@ async fn handle_create(
     let prev_kv = create.prev_kv;
     let start_revision = create.start_revision;
 
+    // Validate `start_revision` up front so a rejected request leaves
+    // no half-registered watch in `store.watches`. One rejection case
+    // is etcd-compatible:
+    //
+    //   * `start_revision <= compacted_rev` (explicit `Compact()` call
+    //     or the ring buffer dropping the entry): reply with a
+    //     one-shot `WatchResponse{compact_revision}` so the client
+    //     re-List at `compacted_rev + 1`.
+    //
+    // We deliberately do NOT reject `start_revision > current_rev`
+    // (e.g. apiserver cached a RV from before netcd restarted and
+    // the new netcd is at a lower rev). Etcd would return
+    // `OutOfRange("Too large resource version: ...")` here, but
+    // because netcd is in-memory and restarts lose state, the
+    // apiserver's `ResourceVersion` cache is frequently one restart
+    // ahead of netcd. Returning OutOfRange triggers a re-List on
+    // every resource type in parallel, producing a burst of
+    // `E... watcher.go:425 watch chan error: ... Too large resource
+    // version: X, current: Y` lines in the apiserver log (one per
+    // resource, e.g. 25+ at once).
+    //
+    // Instead, we accept the watch, skip the historical replay
+    // (start_revision is in the future so the buffer has no matching
+    // events), and register the watch for live events. The apiserver
+    // will receive any new mutations at the next available rev and
+    // process them normally; the previous List response is still
+    // the source of truth for the current state.
+    if start_revision > 0 {
+        let compacted = store
+            .compacted_rev
+            .load(std::sync::atomic::Ordering::Relaxed) as i64;
+        if start_revision <= compacted {
+            tx.send(Ok(WatchResponse {
+                header: header(compacted),
+                watch_id: 0,
+                compact_revision: compacted,
+                ..Default::default()
+            }))
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+            return Ok(());
+        }
+    }
+
     let watch_id = store.alloc_watch_id();
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
 
@@ -176,32 +220,6 @@ async fn handle_create(
     .map_err(|e| Status::internal(e.to_string()))?;
 
     if start_revision > 0 {
-        let cur = store.current_rev() as i64;
-        let compacted = store
-            .compacted_rev
-            .load(std::sync::atomic::Ordering::Relaxed) as i64;
-        if start_revision < compacted {
-            tx.send(Ok(WatchResponse {
-                header: header(compacted),
-                watch_id,
-                compact_revision: compacted,
-                ..Default::default()
-            }))
-            .await
-            .ok();
-            return Ok(());
-        }
-        if start_revision > cur {
-            tx.send(Ok(WatchResponse {
-                header: header(start_revision),
-                watch_id,
-                compact_revision: 0,
-                ..Default::default()
-            }))
-            .await
-            .ok();
-            return Ok(());
-        }
         let snap = store.history.snapshot();
         for m in snap {
             if (m.rev as i64) < start_revision {

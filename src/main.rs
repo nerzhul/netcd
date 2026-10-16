@@ -263,7 +263,10 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
     let auth = Authenticator::new(cfg_arcswap.clone(), cli.mtls);
 
     // Spawn background tasks: lease expiry, history trim, SIGHUP reload.
-    let lease_tick = Duration::from_millis((config.server_max_ttl_seconds as u64 / 100).max(250));
+    let lease_tick = {
+        let ttl_secs = config.server_max_ttl_seconds.max(1) as u64;
+        Duration::from_secs((ttl_secs / 100).max(1))
+    };
     netcd::store::lease::spawn_expiry_loop(store.clone(), lease_tick);
 
     // SIGHUP -> reload config from disk and update live state.
