@@ -24,9 +24,7 @@ pub enum StoreError {
 impl From<StoreError> for Status {
     fn from(e: StoreError) -> Self {
         match e {
-            StoreError::InvalidArgument(m) => {
-                Status::new(tonic::Code::InvalidArgument, m)
-            }
+            StoreError::InvalidArgument(m) => Status::new(tonic::Code::InvalidArgument, m),
             StoreError::OutOfRange(m) => Status::new(tonic::Code::OutOfRange, m),
             StoreError::Internal(m) => Status::internal(m),
         }

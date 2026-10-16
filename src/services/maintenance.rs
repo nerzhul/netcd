@@ -13,9 +13,8 @@ use tonic::{Request, Response, Status};
 
 use crate::proto::etcdserverpb::{
     AlarmRequest, AlarmResponse, DefragmentRequest, DefragmentResponse, DowngradeRequest,
-    DowngradeResponse, HashRequest, HashResponse, HashKvRequest, HashKvResponse,
-    MoveLeaderRequest, MoveLeaderResponse, SnapshotRequest, SnapshotResponse, StatusRequest,
-    StatusResponse,
+    DowngradeResponse, HashKvRequest, HashKvResponse, HashRequest, HashResponse, MoveLeaderRequest,
+    MoveLeaderResponse, SnapshotRequest, SnapshotResponse, StatusRequest, StatusResponse,
 };
 use crate::store::Store;
 

@@ -111,12 +111,7 @@ impl Store {
     }
 
     /// Put (insert or upsert) a key. Returns the new revision.
-    pub fn put(
-        &self,
-        key: Bytes,
-        value: Bytes,
-        lease_id: Option<i64>,
-    ) -> Result<u64, StoreError> {
+    pub fn put(&self, key: Bytes, value: Bytes, lease_id: Option<i64>) -> Result<u64, StoreError> {
         if key.is_empty() {
             return Err(StoreError::InvalidArgument("key must not be empty".into()));
         }
@@ -209,11 +204,7 @@ impl Store {
         self.delete_inner(key, kind)
     }
 
-    fn delete_inner(
-        &self,
-        key: Bytes,
-        kind: MutationKind,
-    ) -> Result<(u64, i64), StoreError> {
+    fn delete_inner(&self, key: Bytes, kind: MutationKind) -> Result<(u64, i64), StoreError> {
         if key.is_empty() {
             return Err(StoreError::InvalidArgument("key must not be empty".into()));
         }
@@ -278,7 +269,11 @@ impl Store {
         }
         let kv = self.kv.read();
         let mut out = Vec::new();
-        let limit_u = if limit <= 0 { usize::MAX } else { limit as usize };
+        let limit_u = if limit <= 0 {
+            usize::MAX
+        } else {
+            limit as usize
+        };
         use std::ops::Bound;
         if range_end.is_empty() {
             if let Some(e) = kv.get(key) {
@@ -450,12 +445,24 @@ mod tests {
         // appended). etcd's `getPrefix` produces rangeBytes of the
         // same length as the key.
         let s = Store::new(1024, 100);
-        s.put(Bytes::from_static(b"/foo/a"), Bytes::from_static(b"v-a"), None)
-            .unwrap();
-        s.put(Bytes::from_static(b"/foo/b"), Bytes::from_static(b"v-b"), None)
-            .unwrap();
-        s.put(Bytes::from_static(b"/foo/c"), Bytes::from_static(b"v-c"), None)
-            .unwrap();
+        s.put(
+            Bytes::from_static(b"/foo/a"),
+            Bytes::from_static(b"v-a"),
+            None,
+        )
+        .unwrap();
+        s.put(
+            Bytes::from_static(b"/foo/b"),
+            Bytes::from_static(b"v-b"),
+            None,
+        )
+        .unwrap();
+        s.put(
+            Bytes::from_static(b"/foo/c"),
+            Bytes::from_static(b"v-c"),
+            None,
+        )
+        .unwrap();
         // 5-byte key, 5-byte range_end (last byte '/' -> '0').
         let key: &[u8] = b"/foo/";
         let range_end: &[u8] = b"/foo0";
@@ -472,10 +479,18 @@ mod tests {
     #[test]
     fn range_open_end_nul() {
         let s = Store::new(1024, 100);
-        s.put(Bytes::from_static(b"/foo/a"), Bytes::from_static(b"v-a"), None)
-            .unwrap();
-        s.put(Bytes::from_static(b"/foo/b"), Bytes::from_static(b"v-b"), None)
-            .unwrap();
+        s.put(
+            Bytes::from_static(b"/foo/a"),
+            Bytes::from_static(b"v-a"),
+            None,
+        )
+        .unwrap();
+        s.put(
+            Bytes::from_static(b"/foo/b"),
+            Bytes::from_static(b"v-b"),
+            None,
+        )
+        .unwrap();
         let got = s.range(b"/foo/", b"\x00", 0, 0).unwrap();
         assert_eq!(got.len(), 2);
     }

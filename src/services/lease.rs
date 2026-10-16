@@ -9,9 +9,9 @@ use tracing::warn;
 
 use crate::auth::Authenticator;
 use crate::proto::etcdserverpb::{
-    self, LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest,
-    LeaseKeepAliveResponse, LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest,
-    LeaseRevokeResponse, LeaseTimeToLiveRequest, LeaseTimeToLiveResponse,
+    self, LeaseGrantRequest, LeaseGrantResponse, LeaseKeepAliveRequest, LeaseKeepAliveResponse,
+    LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse,
+    LeaseTimeToLiveRequest, LeaseTimeToLiveResponse,
 };
 use crate::store::{MutationKind, Store};
 

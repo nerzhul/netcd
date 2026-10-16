@@ -11,8 +11,8 @@ use tracing::{debug, warn};
 use crate::auth::Authenticator;
 use crate::error::failed_precondition;
 use crate::proto::etcdserverpb::{
-    self, watch_request, ResponseHeader, WatchCancelRequest, WatchCreateRequest,
-    WatchRequest, WatchResponse,
+    self, watch_request, ResponseHeader, WatchCancelRequest, WatchCreateRequest, WatchRequest,
+    WatchResponse,
 };
 use crate::proto::mvccpb::{self, event::EventType, Event};
 use crate::store::history::Mutation;

@@ -19,9 +19,9 @@ use tonic::{Request, Response, Status};
 use crate::auth::{Authenticator, Identity};
 use crate::error::internal;
 use crate::proto::etcdserverpb::{
-    self, request_op::Request as ReqOpVariant, response_op::Response as RespOpVariant,
-    Compare, DeleteRangeRequest, DeleteRangeResponse, PutRequest, PutResponse, RangeRequest,
-    RangeResponse, RequestOp, ResponseOp, TxnRequest, TxnResponse,
+    self, request_op::Request as ReqOpVariant, response_op::Response as RespOpVariant, Compare,
+    DeleteRangeRequest, DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse,
+    RequestOp, ResponseOp, TxnRequest, TxnResponse,
 };
 use crate::proto::mvccpb;
 use crate::store::{MutationKind, Store};
