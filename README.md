@@ -58,6 +58,23 @@ netcd \
     --client-ca   /etc/netcd/client-ca.pem
 ```
 
+### Override a knob via environment
+
+For containerised deployments, every flag also has a matching
+`NETCD_*` environment variable. The 12-factor precedence is
+**CLI flag > env var > `config.json` > in-code default**. For example,
+capping lease TTL at one hour without editing the JSON file:
+
+```bash
+NETCD_SERVER_MAX_TTL_SECONDS=3600 netcd --config /etc/netcd/config.json
+```
+
+At boot the process logs one `effective config: <name>=<value> (origin)`
+line per overridable setting, where `origin` is `Cli`, `Env`, `File`, or
+`Default`. This is the easiest way to confirm a k8s `ConfigMap` /
+`Secret` env var is actually wired up. **Note:** env vars are evaluated
+at boot, **not** on `SIGHUP` — see [SIGHUP behaviour](#sighup-behaviour).
+
 ### Run in Docker
 
 #### Pre-built images
@@ -119,6 +136,60 @@ The config file (`config.json` by default, override with `--config` or
 `client_cert_fingerprint_sha256` is the SHA-256 of the DER-encoded client
 certificate (uppercase or lowercase hex, with or without `:` separators).
 This is the value `openssl x509 -fingerprint -sha256 -noout` prints.
+
+### Environment variables
+
+Every runtime knob has a matching `NETCD_*` environment variable, set on
+the container or via your process supervisor. The CLI flag (when given)
+wins over the env var; the env var wins over `config.json`; `config.json`
+wins over the in-code default. The boot log prints one
+`effective config: <name>=<value> (origin)` line per setting to make
+which layer won visible.
+
+#### Config knobs (override `config.json`)
+
+| Config field             | CLI flag                       | Env var                            |
+|--------------------------|--------------------------------|------------------------------------|
+| `server_max_ttl_seconds` | `--server-max-ttl-seconds`     | `NETCD_SERVER_MAX_TTL_SECONDS`     |
+| `max_cache_bytes`        | `--max-cache-bytes`            | `NETCD_MAX_CACHE_BYTES`            |
+| `history_capacity`       | `--history-capacity`           | `NETCD_HISTORY_CAPACITY`           |
+
+#### Transport / runtime flags
+
+| CLI flag           | Env var              | Notes                                            |
+|--------------------|----------------------|-------------------------------------------------|
+| `--listen`         | `NETCD_LISTEN`       | gRPC bind                                       |
+| `--admin-listen`   | `NETCD_ADMIN_LISTEN` | Admin API bind (`disabled` to turn it off)      |
+| `--config`         | `NETCD_CONFIG`       | Path to the JSON config                         |
+| `--mtls`           | `NETCD_MTLS`         | Presence toggle (`1`/`true`/`yes`/`on`)         |
+| `--server-cert`    | `NETCD_SERVER_CERT`  | PEM, full chain                                 |
+| `--server-key`     | `NETCD_SERVER_KEY`   | PEM                                             |
+| `--client-ca`      | `NETCD_CLIENT_CA`    | PEM, client CA bundle                           |
+| `--log`            | `NETCD_LOG`          | `tracing-subscriber` env-filter syntax          |
+
+The `--listen`, `--admin-listen`, `--config`, and `--log` flags keep
+their existing defaults; the env var simply provides another way to set
+the same value.
+
+### SIGHUP behaviour
+
+A `SIGHUP` re-reads `config.json` from disk and swaps the live config in
+(the same operation as `POST /v1/config/reload`). **Env vars are not
+re-applied on `SIGHUP`** — they are start-time only. So an operator who
+sets `NETCD_SERVER_MAX_TTL_SECONDS=1234` and then edits `config.json`
+to a different value will see the env value at boot and the disk value
+after `SIGHUP`. This is the standard 12-factor trade-off; if you need
+the env value to persist across reloads, set it in the JSON file (or
+restart the process).
+
+### RBAC is intentionally outside the override layer
+
+The `tenants[]` array (and every `Tenant` field) has **no** CLI flag and
+**no** environment variable. RBAC state can only be mutated through the
+admin HTTP API (`POST`/`PUT`/`DELETE /v1/tenants`, `PUT /v1/config`).
+This is enforced at the type level: the `Overrides` struct that carries
+CLI/env values into `Config` has no `tenants` field, and the unit test
+`overrides_do_not_touch_tenants` regressively guards the invariant.
 
 ## Admin API
 

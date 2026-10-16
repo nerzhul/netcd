@@ -96,6 +96,24 @@ impl Config {
         Ok(())
     }
 
+    /// Return a copy of `self` with any `Some(...)` fields in `o` applied
+    /// on top. Fields left in `None` are preserved from the receiver.
+    ///
+    /// `tenants` is deliberately **not** overridable through this path:
+    /// the `Overrides` type has no `tenants` field, so RBAC edits must go
+    /// through the admin HTTP API. This invariant is asserted in the
+    /// unit tests below.
+    pub fn with_overrides(&self, o: &Overrides) -> Config {
+        Config {
+            server_max_ttl_seconds: o
+                .server_max_ttl_seconds
+                .unwrap_or(self.server_max_ttl_seconds),
+            max_cache_bytes: o.max_cache_bytes.unwrap_or(self.max_cache_bytes),
+            history_capacity: o.history_capacity.unwrap_or(self.history_capacity),
+            tenants: self.tenants.clone(),
+        }
+    }
+
     /// Sanity-check the config at load time.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
@@ -130,6 +148,22 @@ fn tmp_path(p: &Path) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(".tmp");
     PathBuf::from(s)
+}
+
+/// Field-level overrides layered on top of a JSON-loaded `Config`.
+///
+/// Populated from CLI flags and/or environment variables. A `None` means
+/// "do not override" — the underlying `Config` value is kept.
+///
+/// This struct deliberately has no `tenants` (or `Tenant`-shaped) field.
+/// RBAC state is only mutable through the admin HTTP API; if a future
+/// change adds such a field, the `overrides_do_not_touch_tenants` test
+/// will catch the unintended re-friction through `with_overrides`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Overrides {
+    pub server_max_ttl_seconds: Option<i64>,
+    pub max_cache_bytes: Option<u64>,
+    pub history_capacity: Option<usize>,
 }
 
 /// A thread-safe, hot-reloadable handle to the live config.
@@ -225,5 +259,82 @@ mod tests {
             client_cert_fingerprint_sha256: "AB".into(),
         });
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn override_applies_each_field_when_some() {
+        let base = Config::default_dev();
+        let o = Overrides {
+            server_max_ttl_seconds: Some(42),
+            max_cache_bytes: Some(99),
+            history_capacity: Some(7),
+        };
+        let out = base.with_overrides(&o);
+        assert_eq!(out.server_max_ttl_seconds, 42);
+        assert_eq!(out.max_cache_bytes, 99);
+        assert_eq!(out.history_capacity, 7);
+        // Default-constructed base has no tenants; the override path must
+        // not introduce any.
+        assert!(out.tenants.is_empty());
+    }
+
+    #[test]
+    fn override_preserves_value_when_none() {
+        let mut base = Config::default_dev();
+        base.server_max_ttl_seconds = 123;
+        base.max_cache_bytes = 456;
+        base.history_capacity = 789;
+        let o = Overrides::default();
+        let out = base.with_overrides(&o);
+        assert_eq!(out.server_max_ttl_seconds, 123);
+        assert_eq!(out.max_cache_bytes, 456);
+        assert_eq!(out.history_capacity, 789);
+    }
+
+    #[test]
+    fn override_partially_applies() {
+        let base = Config::default_dev();
+        let o = Overrides {
+            history_capacity: Some(99),
+            ..Overrides::default()
+        };
+        let out = base.with_overrides(&o);
+        assert_eq!(out.server_max_ttl_seconds, base.server_max_ttl_seconds);
+        assert_eq!(out.max_cache_bytes, base.max_cache_bytes);
+        assert_eq!(out.history_capacity, 99);
+    }
+
+    #[test]
+    fn overrides_do_not_touch_tenants() {
+        // Build a config that has RBAC state, run `with_overrides` with a
+        // fully populated `Overrides`, and assert the tenants come back
+        // bit-for-bit identical. Combined with the type-level invariant
+        // that `Overrides` has no `tenants` field, this guards against
+        // any future contributor re-introducing tenant material on the
+        // CLI/env surface.
+        let mut base = Config::default_dev();
+        base.tenants.push(Tenant {
+            name: "team-a".into(),
+            allowed_prefixes: vec!["/registry/events/team-a/".into()],
+            client_cert_fingerprint_sha256: "ab:cd".into(),
+        });
+        base.tenants.push(Tenant {
+            name: "team-b".into(),
+            allowed_prefixes: vec!["/registry/events/team-b/".into()],
+            client_cert_fingerprint_sha256: "de:ad:be:ef".into(),
+        });
+        let original_tenants = base.tenants.clone();
+
+        let o = Overrides {
+            server_max_ttl_seconds: Some(1),
+            max_cache_bytes: Some(2),
+            history_capacity: Some(3),
+        };
+        let out = base.with_overrides(&o);
+
+        assert_eq!(out.tenants, original_tenants);
+        assert_eq!(out.tenants.len(), 2);
+        assert_eq!(out.tenants[0].name, "team-a");
+        assert_eq!(out.tenants[1].name, "team-b");
     }
 }

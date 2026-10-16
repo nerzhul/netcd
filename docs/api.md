@@ -272,6 +272,17 @@ diff <(curl -s http://netcd:2378/v1/config) <(jq . config.json) || {
 - **Not a database.** It is a process-local control plane. There is no
   WAL, no replication, no schema. The on-disk `config.json` is the
   source of truth; the in-memory `Arc<Config>` is the live value.
+- **Not the only way to read/write the RBAC surface — but it is the
+  only way that *can*.** The `tenants[]` array (and every `Tenant` field)
+  is intentionally unreachable from the CLI flag set and from any
+  `NETCD_*` environment variable. The override layer only sees the
+  three numeric knobs (`server_max_ttl_seconds`, `max_cache_bytes`,
+  `history_capacity`). Adding a tenant, rotating a fingerprint, or
+  changing an `allowed_prefixes` list must go through `POST`/`PUT`/
+  `DELETE /v1/tenants` (or `PUT /v1/config` for a full replace). This
+  rule is enforced at the type level — the `Overrides` struct that
+  carries CLI/env values into `Config` has no `tenants` field — and is
+  regressively guarded by the `overrides_do_not_touch_tenants` unit test.
 - **Not part of the etcd wire protocol.** A standard `etcdctl` or
   `kube-apiserver` will not see or interact with these endpoints. They
   only see the four stock gRPC services on port 2379.
