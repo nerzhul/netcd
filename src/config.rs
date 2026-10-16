@@ -22,6 +22,12 @@ fn default_max_cache_bytes() -> u64 {
 fn default_history_capacity() -> usize {
     1000
 }
+// Deliberately smaller than `std::thread::available_parallelism()` so the
+// process does not gobble every core on a busy host; the gRPC workload is
+// mostly I/O-bound and does not benefit from a 1-thread-per-core model.
+fn default_worker_threads() -> usize {
+    3
+}
 
 /// Per-tenant ACL and identity binding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,6 +49,12 @@ pub struct Config {
     pub max_cache_bytes: u64,
     #[serde(default = "default_history_capacity")]
     pub history_capacity: usize,
+    /// Number of OS threads the async runtime drives. Name is deliberately
+    /// runtime-agnostic so swapping the implementation does not invalidate
+    /// operator tooling or persisted config files. Boot-time only —
+    /// changing it requires a restart.
+    #[serde(default = "default_worker_threads")]
+    pub worker_threads: usize,
     pub tenants: Vec<Tenant>,
 }
 
@@ -53,6 +65,7 @@ impl Config {
             server_max_ttl_seconds: default_server_max_ttl(),
             max_cache_bytes: default_max_cache_bytes(),
             history_capacity: default_history_capacity(),
+            worker_threads: default_worker_threads(),
             tenants: Vec::new(),
         }
     }
@@ -110,6 +123,7 @@ impl Config {
                 .unwrap_or(self.server_max_ttl_seconds),
             max_cache_bytes: o.max_cache_bytes.unwrap_or(self.max_cache_bytes),
             history_capacity: o.history_capacity.unwrap_or(self.history_capacity),
+            worker_threads: o.worker_threads.unwrap_or(self.worker_threads),
             tenants: self.tenants.clone(),
         }
     }
@@ -122,6 +136,7 @@ impl Config {
         );
         anyhow::ensure!(self.max_cache_bytes > 0, "max_cache_bytes must be > 0");
         anyhow::ensure!(self.history_capacity > 0, "history_capacity must be > 0");
+        anyhow::ensure!(self.worker_threads > 0, "worker_threads must be > 0");
         let mut seen = std::collections::HashSet::new();
         for t in &self.tenants {
             anyhow::ensure!(!t.name.is_empty(), "tenant name must be non-empty");
@@ -164,6 +179,7 @@ pub struct Overrides {
     pub server_max_ttl_seconds: Option<i64>,
     pub max_cache_bytes: Option<u64>,
     pub history_capacity: Option<usize>,
+    pub worker_threads: Option<usize>,
 }
 
 /// A thread-safe, hot-reloadable handle to the live config.
@@ -268,11 +284,13 @@ mod tests {
             server_max_ttl_seconds: Some(42),
             max_cache_bytes: Some(99),
             history_capacity: Some(7),
+            worker_threads: Some(5),
         };
         let out = base.with_overrides(&o);
         assert_eq!(out.server_max_ttl_seconds, 42);
         assert_eq!(out.max_cache_bytes, 99);
         assert_eq!(out.history_capacity, 7);
+        assert_eq!(out.worker_threads, 5);
         // Default-constructed base has no tenants; the override path must
         // not introduce any.
         assert!(out.tenants.is_empty());
@@ -284,11 +302,13 @@ mod tests {
         base.server_max_ttl_seconds = 123;
         base.max_cache_bytes = 456;
         base.history_capacity = 789;
+        base.worker_threads = 11;
         let o = Overrides::default();
         let out = base.with_overrides(&o);
         assert_eq!(out.server_max_ttl_seconds, 123);
         assert_eq!(out.max_cache_bytes, 456);
         assert_eq!(out.history_capacity, 789);
+        assert_eq!(out.worker_threads, 11);
     }
 
     #[test]
@@ -302,6 +322,7 @@ mod tests {
         assert_eq!(out.server_max_ttl_seconds, base.server_max_ttl_seconds);
         assert_eq!(out.max_cache_bytes, base.max_cache_bytes);
         assert_eq!(out.history_capacity, 99);
+        assert_eq!(out.worker_threads, base.worker_threads);
     }
 
     #[test]
@@ -329,6 +350,7 @@ mod tests {
             server_max_ttl_seconds: Some(1),
             max_cache_bytes: Some(2),
             history_capacity: Some(3),
+            worker_threads: Some(4),
         };
         let out = base.with_overrides(&o);
 
@@ -336,5 +358,20 @@ mod tests {
         assert_eq!(out.tenants.len(), 2);
         assert_eq!(out.tenants[0].name, "team-a");
         assert_eq!(out.tenants[1].name, "team-b");
+    }
+
+    #[test]
+    fn default_dev_worker_threads_is_three() {
+        // Locked-in default; if a future contributor wants to change it,
+        // they have to update this test too, which surfaces the change in
+        // code review.
+        assert_eq!(Config::default_dev().worker_threads, 3);
+    }
+
+    #[test]
+    fn validate_rejects_zero_worker_threads() {
+        let mut cfg = Config::default_dev();
+        cfg.worker_threads = 0;
+        assert!(cfg.validate().is_err());
     }
 }

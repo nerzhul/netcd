@@ -123,6 +123,7 @@ The config file (`config.json` by default, override with `--config` or
   "server_max_ttl_seconds": 86400,        // clamp on Lease.Grant
   "max_cache_bytes":        268435456,    // 256 MiB ceiling (keys+values)
   "history_capacity":       1000,          // ring buffer for Watch start_revision
+  "worker_threads":         3,             // async-runtime worker pool size (boot-time only)
   "tenants": [
     {
       "name": "team-a-apiserver",
@@ -153,6 +154,7 @@ which layer won visible.
 | `server_max_ttl_seconds` | `--server-max-ttl-seconds`     | `NETCD_SERVER_MAX_TTL_SECONDS`     |
 | `max_cache_bytes`        | `--max-cache-bytes`            | `NETCD_MAX_CACHE_BYTES`            |
 | `history_capacity`       | `--history-capacity`           | `NETCD_HISTORY_CAPACITY`           |
+| `worker_threads`         | `--worker-threads`             | `NETCD_WORKER_THREADS`             |
 
 #### Transport / runtime flags
 
@@ -181,6 +183,12 @@ to a different value will see the env value at boot and the disk value
 after `SIGHUP`. This is the standard 12-factor trade-off; if you need
 the env value to persist across reloads, set it in the JSON file (or
 restart the process).
+
+Note that `worker_threads` is also strictly boot-time: the async
+runtime is built once at startup with the resolved value, and the pool
+size is immutable for the life of the process. Changing the value at
+runtime (via `PUT /v1/config`, `SIGHUP`, or a config edit) is
+persisted and will take effect on the **next** process start.
 
 ### RBAC is intentionally outside the override layer
 

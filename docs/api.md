@@ -59,6 +59,7 @@ curl http://localhost:2378/v1/config | jq
   "server_max_ttl_seconds": 86400,
   "max_cache_bytes": 268435456,
   "history_capacity": 1000,
+  "worker_threads": 3,
   "tenants": []
 }
 ```
@@ -82,6 +83,7 @@ Example body:
   "server_max_ttl_seconds": 43200,
   "max_cache_bytes": 536870912,
   "history_capacity": 2000,
+  "worker_threads": 3,
   "tenants": [
     {
       "name": "team-a-apiserver",
@@ -243,12 +245,13 @@ curl http://netcd:2378/v1/tenants | jq
 
 ```bash
 # Cap all leases at 1 hour.
-curl -X PUT http://netcd:2378/v1/config \
+curl -X PUT http://localhost:2378/v1/config \
      -H 'Content-Type: application/json' \
      -d '{
            "server_max_ttl_seconds": 3600,
            "max_cache_bytes": 268435456,
            "history_capacity": 1000,
+           "worker_threads": 3,
            "tenants": []
          }'
 ```
@@ -276,13 +279,14 @@ diff <(curl -s http://netcd:2378/v1/config) <(jq . config.json) || {
   only way that *can*.** The `tenants[]` array (and every `Tenant` field)
   is intentionally unreachable from the CLI flag set and from any
   `NETCD_*` environment variable. The override layer only sees the
-  three numeric knobs (`server_max_ttl_seconds`, `max_cache_bytes`,
-  `history_capacity`). Adding a tenant, rotating a fingerprint, or
-  changing an `allowed_prefixes` list must go through `POST`/`PUT`/
-  `DELETE /v1/tenants` (or `PUT /v1/config` for a full replace). This
-  rule is enforced at the type level — the `Overrides` struct that
-  carries CLI/env values into `Config` has no `tenants` field — and is
-  regressively guarded by the `overrides_do_not_touch_tenants` unit test.
+  four numeric knobs (`server_max_ttl_seconds`, `max_cache_bytes`,
+  `history_capacity`, `worker_threads`). Adding a tenant, rotating a
+  fingerprint, or changing an `allowed_prefixes` list must go through
+  `POST`/`PUT`/`DELETE /v1/tenants` (or `PUT /v1/config` for a full
+  replace). This rule is enforced at the type level — the `Overrides`
+  struct that carries CLI/env values into `Config` has no `tenants`
+  field — and is regressively guarded by the
+  `overrides_do_not_touch_tenants` unit test.
 - **Not part of the etcd wire protocol.** A standard `etcdctl` or
   `kube-apiserver` will not see or interact with these endpoints. They
   only see the four stock gRPC services on port 2379.

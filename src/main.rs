@@ -71,6 +71,14 @@ struct Cli {
     /// `NETCD_HISTORY_CAPACITY`.
     #[arg(long, env = "NETCD_HISTORY_CAPACITY")]
     history_capacity: Option<usize>,
+
+    /// Override the size of the async-runtime worker pool. Defaults to
+    /// the value in `config.json` (or `3` when neither is set), which is
+    /// intentionally smaller than the host's CPU count. Overridable via
+    /// `NETCD_WORKER_THREADS`. Boot-time only — changing this requires a
+    /// restart.
+    #[arg(long, env = "NETCD_WORKER_THREADS")]
+    worker_threads: Option<usize>,
 }
 
 fn init_tracing(filter: &str) {
@@ -163,6 +171,13 @@ fn log_effective_config(cli: &Cli, config: &Config, file_present: bool) {
         &config.history_capacity,
         &defaults.history_capacity,
     );
+    let workers_origin = classify(
+        cli.worker_threads.is_some(),
+        std::env::var_os("NETCD_WORKER_THREADS").is_some(),
+        file_present,
+        &config.worker_threads,
+        &defaults.worker_threads,
+    );
 
     info!(
         "effective config: server_max_ttl_seconds={} ({:?})",
@@ -176,10 +191,13 @@ fn log_effective_config(cli: &Cli, config: &Config, file_present: bool) {
         "effective config: history_capacity={} ({:?})",
         config.history_capacity, hist_origin
     );
+    info!(
+        "effective config: worker_threads={} ({:?})",
+        config.worker_threads, workers_origin
+    );
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(&cli.log);
 
@@ -209,6 +227,7 @@ async fn main() -> Result<()> {
         server_max_ttl_seconds: cli.server_max_ttl_seconds,
         max_cache_bytes: cli.max_cache_bytes,
         history_capacity: cli.history_capacity,
+        worker_threads: cli.worker_threads,
     };
     let config = config.with_overrides(&overrides);
     config
@@ -219,6 +238,21 @@ async fn main() -> Result<()> {
     // each numeric knob and its origin (cli > env > file > default).
     log_effective_config(&cli, &config, file_was_present);
 
+    // Build the async runtime with the configured worker count. We use the
+    // explicit `Builder` API rather than `#[tokio::main(worker_threads = N)]`
+    // because the macro argument is a compile-time constant and the value
+    // here comes from CLI/env/config at boot.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.worker_threads)
+        .enable_all()
+        .thread_name("netcd-worker")
+        .build()
+        .context("building tokio runtime")?;
+
+    runtime.block_on(run(cli, config))
+}
+
+async fn run(cli: Cli, config: Config) -> Result<()> {
     let cfg_ref = ConfigRef::new(config.clone(), cli.config.clone());
 
     // Store.
