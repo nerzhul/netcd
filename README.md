@@ -48,6 +48,12 @@ cargo run --release -- \
     --config      config.json
 ```
 
+Building from source needs the Protocol Buffers compiler (`protoc`) on the
+`PATH`: `build.rs` runs `tonic-build` to generate the gRPC stubs at compile
+time. Install it with `apt-get install protobuf-compiler`,
+`brew install protobuf` or `pacman -S protobuf`. The Docker build installs it
+for you.
+
 A default `config.json` is auto-created on first run. To enable mTLS:
 
 ```bash
@@ -80,12 +86,20 @@ at boot, **not** on `SIGHUP` — see [SIGHUP behaviour](#sighup-behaviour).
 #### Pre-built images
 
 Tagged releases are published automatically by the
-[`release-docker`](.github/workflows/docker.yml) workflow to:
+[`docker`](.github/workflows/docker.yml) workflow to:
 
 - `ghcr.io/<owner>/netcd:<tag>` (e.g. `ghcr.io/nerzhul/netcd:v1.2.3`)
 
 Each semver tag `vX.Y.Z` produces the rolling tags `X.Y.Z`, `X.Y`, and `X`,
-plus a short git SHA. `latest` is reserved for the default branch.
+plus a short git SHA. The `latest` tag is only applied by a manual dispatch of
+the workflow from the default branch, so a tag push never silently promotes to
+`latest`.
+
+The same workflow builds the image on every pull request and on every push to
+`main`, but those runs are **not** published. The container image is the only
+artefact of this repository: there is no separate native (non-Docker) build
+pipeline, `cargo build` only ever runs inside the builder stage of the
+Dockerfile.
 
 #### Local build
 
@@ -94,6 +108,12 @@ docker build -t netcd:dev .
 docker run --rm -p 2379:2379 -p 2378:2378 \
     -v $PWD/config.json:/etc/netcd/config.json \
     netcd:dev
+```
+
+Multi-architecture build, like the release pipeline:
+
+```bash
+docker buildx build --platform linux/amd64,linux/arm64 -t netcd:dev .
 ```
 
 ### Point a kube-apiserver at it
@@ -237,7 +257,7 @@ return `Result<T, tonic::Status>` without allocation on success.
 ## Testing
 
 ```bash
-cargo test              # 16 unit tests + 5 e2e integration tests
+cargo test              # 27 unit tests + 9 e2e integration tests + 3 build contract tests
 cargo test --release    # slower to compile, faster to run
 ```
 
@@ -245,6 +265,10 @@ The integration tests build a real CA + server cert + client cert in
 process via `rcgen`, spin up a real `netcd` instance, and exercise
 Put/Get/Watch/Txn over the etcd v3 gRPC surface using the generated
 `KvClient`/`WatchClient` from `tonic-build`.
+
+The build contract tests (`tests/build_contract.rs`) pin the Docker and CI
+contract: the builder image must ship `protoc`, the image must be built on
+pull requests and on `main`, and it must only be published on a release.
 
 ## License
 
