@@ -12,6 +12,10 @@
 # only artefact, so `cargo build`/`cargo test` only ever run inside the
 # builder stage of the Dockerfile.
 #
+# There is no build cache either: every run compiles the dependencies from
+# scratch, so the pipeline stays trivially predictable at the cost of a longer
+# build.
+#
 # Images are pushed to:
 #   * ghcr.io/<owner>/netcd                          (uses GITHUB_TOKEN,
 #                                                    needs the `packages: write`
@@ -93,5 +97,3 @@ jobs:
           push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max

@@ -6,23 +6,15 @@ WORKDIR /build
 
 # `build.rs` runs tonic-build/prost-build, which shells out to `protoc` to
 # compile the .proto files. The stock rust image does not ship it, so install
-# the Debian package before any cargo invocation (build time only, the final
+# the Debian package before the cargo invocation (build time only, the final
 # image does not need it).
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
-# Cache deps separately from sources.
 COPY Cargo.toml Cargo.lock ./
 COPY proto ./proto
 COPY build.rs ./
-RUN mkdir -p src && \
-    echo "fn main() { println!(\"dep cache\"); }" > src/main.rs && \
-    echo "" > src/lib.rs && \
-    cargo build --release --bin netcd && \
-    rm -rf src target/release/deps/netcd*
-
-# Build the real binary.
 COPY src ./src
 RUN cargo build --release --bin netcd
 

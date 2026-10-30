@@ -99,7 +99,9 @@ The same workflow builds the image on every pull request and on every push to
 `main`, but those runs are **not** published. The container image is the only
 artefact of this repository: there is no separate native (non-Docker) build
 pipeline, `cargo build` only ever runs inside the builder stage of the
-Dockerfile.
+Dockerfile. The image is built from scratch on every run — no layer or
+dependency cache is kept — so the pipeline stays trivially predictable at the
+cost of a longer build.
 
 #### Local build
 
@@ -257,7 +259,7 @@ return `Result<T, tonic::Status>` without allocation on success.
 ## Testing
 
 ```bash
-cargo test              # 27 unit tests + 9 e2e integration tests + 3 build contract tests
+cargo test              # 27 unit tests + 9 e2e integration tests + 5 build contract tests
 cargo test --release    # slower to compile, faster to run
 ```
 
@@ -267,8 +269,10 @@ Put/Get/Watch/Txn over the etcd v3 gRPC surface using the generated
 `KvClient`/`WatchClient` from `tonic-build`.
 
 The build contract tests (`tests/build_contract.rs`) pin the Docker and CI
-contract: the builder image must ship `protoc`, the image must be built on
-pull requests and on `main`, and it must only be published on a release.
+contract: the builder image must ship `protoc`, the builder stage must
+compile the sources once (no stub build, no build cache), the image must be
+built on pull requests and on `main`, and it must only be published on a
+release.
 
 ## License
 
