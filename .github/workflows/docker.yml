@@ -57,7 +57,7 @@ jobs:
       PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) }}
       # Pull requests only get the native architecture for a fast feedback
       # loop; the release pipeline builds every published architecture.
-      PLATFORMS: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+      PLATFORMS: 'linux/amd64'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
