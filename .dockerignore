@@ -1,0 +1,11 @@
+# Build artefacts and local state, none of them is needed to build the image.
+target/
+.git/
+.gitignore
+.dockerignore
+
+# Local runtime configuration, the image ships config.example.json.
+config.json
+
+# Kilo planning tool state.
+.kilo/
