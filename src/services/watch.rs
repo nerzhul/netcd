@@ -11,12 +11,20 @@ use tracing::{debug, warn};
 use crate::auth::Authenticator;
 use crate::error::failed_precondition;
 use crate::proto::etcdserverpb::{
-    self, watch_request, ResponseHeader, WatchCancelRequest, WatchCreateRequest, WatchRequest,
-    WatchResponse,
+    self, watch_request, RequestProgressRequest, RequestProgressResponse, ResponseHeader,
+    WatchCancelRequest, WatchCreateRequest, WatchRequest, WatchResponse,
 };
 use crate::proto::mvccpb::{self, event::EventType, Event};
 use crate::store::history::Mutation;
-use crate::store::{MutationKind, Store};
+use crate::store::{MutationKind, Store, WatchMessage};
+
+/// How often a watcher that asked for `progress_notify` receives a progress
+/// notification.
+///
+/// etcd uses 10 minutes, which is far too coarse for netcd: the store
+/// revision moves at the pace of the event writes, and the kube-apiserver
+/// watch cache has to be refreshed well before that.
+pub const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// One fan-out event between the store and a single watch stream.
 #[derive(Debug, Clone)]
@@ -57,7 +65,8 @@ pub struct WatchService {
     pub store: Arc<Store>,
     #[allow(dead_code)]
     pub auth: Authenticator,
-    #[allow(dead_code)]
+    /// How often a watcher that asked for `progress_notify` receives a
+    /// progress notification.
     pub progress_interval: Duration,
 }
 
@@ -82,6 +91,7 @@ impl etcdserverpb::watch_server::Watch for WatchService {
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<WatchResponse, Status>>(128);
         let store = self.store.clone();
+        let progress_interval = self.progress_interval;
 
         tokio::spawn(async move {
             let active: Arc<parking_lot::Mutex<Vec<i64>>> =
@@ -91,7 +101,9 @@ impl etcdserverpb::watch_server::Watch for WatchService {
             loop {
                 match in_stream.message().await {
                     Ok(Some(req)) => {
-                        if let Err(e) = handle_request(req, &store, &tx, &active).await {
+                        if let Err(e) =
+                            handle_request(req, &store, &tx, &active, progress_interval).await
+                        {
                             let _ = tx.send(Err(e)).await;
                         }
                     }
@@ -115,6 +127,22 @@ impl etcdserverpb::watch_server::Watch for WatchService {
             rx,
         )))
     }
+
+    /// Send a progress notification to every watcher.
+    ///
+    /// The kube-apiserver calls this through the storage layer whenever one
+    /// of its watch caches waits for a fresher revision: the notification
+    /// carries the current revision, the cache jumps to it and the waiting
+    /// request is served instead of timing out.
+    async fn request_progress(
+        &self,
+        _request: Request<RequestProgressRequest>,
+    ) -> Result<Response<RequestProgressResponse>, Status> {
+        let rev = self.store.broadcast_progress();
+        Ok(Response::new(RequestProgressResponse {
+            header: header(rev as i64),
+        }))
+    }
 }
 
 async fn handle_request(
@@ -122,13 +150,14 @@ async fn handle_request(
     store: &Arc<Store>,
     tx: &mpsc::Sender<Result<WatchResponse, Status>>,
     active: &Arc<parking_lot::Mutex<Vec<i64>>>,
+    progress_interval: Duration,
 ) -> Result<(), Status> {
     let union = req
         .request_union
         .ok_or_else(|| failed_precondition("empty WatchRequest"))?;
     match union {
         watch_request::RequestUnion::CreateRequest(create) => {
-            handle_create(create, store, tx, active).await
+            handle_create(create, store, tx, active, progress_interval).await
         }
         watch_request::RequestUnion::CancelRequest(cancel) => {
             handle_cancel(cancel, store, tx).await
@@ -142,6 +171,7 @@ async fn handle_create(
     store: &Arc<Store>,
     tx: &mpsc::Sender<Result<WatchResponse, Status>>,
     active: &Arc<parking_lot::Mutex<Vec<i64>>>,
+    progress_interval: Duration,
 ) -> Result<(), Status> {
     let key = Bytes::from(create.key);
     let range_end = Bytes::from(create.range_end);
@@ -192,7 +222,7 @@ async fn handle_create(
         }
     }
 
-    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchMessage>();
 
     // Register the watch and snapshot the history in one critical section:
     // a mutation fanned out between the two would be delivered after the
@@ -202,7 +232,7 @@ async fn handle_create(
         key.clone(),
         range_end.clone(),
         prev_kv,
-        watch_tx,
+        watch_tx.clone(),
         start_revision > 0,
     );
     active.lock().push(watch_id);
@@ -230,12 +260,42 @@ async fn handle_create(
         }
     }
 
+    // The client asked for periodic progress notifications (`progress_notify`).
+    let progress_tx = watch_tx.clone();
+    let progress_store = store.clone();
+    tokio::spawn(async move {
+        if !create.progress_notify {
+            return;
+        }
+        let mut ticker = tokio::time::interval(progress_interval);
+        // The first tick of an interval completes immediately, drop it so
+        // the notification is not sent right after the creation response.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let msg = WatchMessage::Progress {
+                rev: progress_store.current_rev(),
+            };
+            if progress_tx.send(msg).is_err() {
+                // The watch is gone.
+                break;
+            }
+        }
+    });
+
     let tx2 = tx.clone();
     let active2 = active.clone();
     let store2 = store.clone();
     tokio::spawn(async move {
-        while let Some(ev) = watch_rx.recv().await {
-            let resp = ev_to_response(&ev, watch_id);
+        while let Some(msg) = watch_rx.recv().await {
+            let resp = match msg {
+                WatchMessage::Event(ev) => ev_to_response(&ev, watch_id),
+                WatchMessage::Progress { rev } => WatchResponse {
+                    header: header(rev as i64),
+                    watch_id,
+                    ..Default::default()
+                },
+            };
             if tx2.send(Ok(resp)).await.is_err() {
                 let mut g = store2.watches.lock();
                 g.remove(&watch_id);

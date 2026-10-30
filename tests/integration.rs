@@ -24,7 +24,8 @@ use netcd::config::{Config, Tenant};
 use netcd::proto::etcdserverpb::kv_client::KvClient;
 use netcd::proto::etcdserverpb::watch_client::WatchClient;
 use netcd::proto::etcdserverpb::{
-    DeleteRangeRequest, PutRequest, RangeRequest, TxnRequest, WatchCreateRequest, WatchRequest,
+    DeleteRangeRequest, PutRequest, RangeRequest, RequestProgressRequest, TxnRequest,
+    WatchCreateRequest, WatchRequest,
 };
 use netcd::server::{build_and_serve, EtcdServerOptions};
 use netcd::store::Store;
@@ -144,7 +145,9 @@ impl Harness {
                 auth,
                 Duration::from_secs(60),
                 100,
-                Duration::from_secs(60),
+                // Short progress notification interval so the periodic
+                // notifications are observable in a test.
+                Duration::from_millis(200),
                 opts,
             )
             .await;
@@ -840,6 +843,123 @@ async fn range_at_a_future_revision_is_rejected_like_etcd() {
     assert_eq!(
         err.message(),
         "etcdserver: mvcc: required revision is a future revision",
+    );
+
+    h.stop().await;
+}
+
+// The kube-apiserver watch cache tracks the revision of the resource it
+// watches, while netcd issues one global revision per mutation. Without
+// progress notifications the cache of an idle resource stays behind the
+// store revision and every request for a fresh resource version times out
+// with `Too large resource version: X, current: Y`. The apiserver asks for
+// those notifications through the `RequestProgress` RPC, every 100ms while
+// a cache waits for freshness.
+
+/// A progress notification is a response without any event whose header
+/// carries the current revision. That is how a client tells it apart from
+/// a regular response.
+fn is_progress_notification(resp: &netcd::proto::etcdserverpb::WatchResponse) -> bool {
+    !resp.created
+        && !resp.canceled
+        && resp.events.is_empty()
+        && resp.compact_revision == 0
+        && resp
+            .header
+            .as_ref()
+            .map(|h| h.revision > 0)
+            .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn request_progress_pushes_a_notification_to_the_watchers() {
+    let h = Harness::start().await;
+    let mut w = h.watch_client().await;
+    let (tx, rx) = futures::channel::mpsc::unbounded::<WatchRequest>();
+    tx.unbounded_send(WatchRequest {
+        request_union: Some(
+            netcd::proto::etcdserverpb::watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"/registry/events/team-a/".to_vec(),
+                    range_end: b"\x00".to_vec(),
+                    ..Default::default()
+                },
+            ),
+        ),
+    })
+    .unwrap();
+    let mut stream = w.watch(rx).await.unwrap().into_inner();
+
+    // Drain the create response.
+    let created = stream.next().await.expect("create response").unwrap();
+    assert!(created.created, "expected the create response");
+
+    let resp = w
+        .request_progress(RequestProgressRequest {})
+        .await
+        .expect("request_progress must be implemented");
+    let rev = resp.into_inner().header.expect("header").revision;
+    assert!(rev > 0, "the response must carry the current revision");
+
+    let notified = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("a progress notification must be pushed")
+        .expect("stream must stay open")
+        .expect("no error");
+    assert!(
+        is_progress_notification(&notified),
+        "expected a progress notification, got created={} canceled={} events={} compact_revision={}",
+        notified.created,
+        notified.canceled,
+        notified.events.len(),
+        notified.compact_revision,
+    );
+    assert_eq!(
+        notified.header.expect("header").revision,
+        rev,
+        "the notification must carry the current revision",
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn periodic_progress_notification_is_sent_to_progress_notify_watchers() {
+    let h = Harness::start().await;
+    let mut w = h.watch_client().await;
+    let (tx, rx) = futures::channel::mpsc::unbounded::<WatchRequest>();
+    tx.unbounded_send(WatchRequest {
+        request_union: Some(
+            netcd::proto::etcdserverpb::watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"/registry/events/team-a/".to_vec(),
+                    range_end: b"\x00".to_vec(),
+                    progress_notify: true,
+                    ..Default::default()
+                },
+            ),
+        ),
+    })
+    .unwrap();
+    let mut stream = w.watch(rx).await.unwrap().into_inner();
+
+    // The watch stream must deliver a progress notification without any
+    // write happening on the store.
+    let mut notified = false;
+    for _ in 0..8 {
+        let resp = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("a progress notification must be pushed")
+            .expect("stream must stay open")
+            .expect("no error");
+        if is_progress_notification(&resp) {
+            notified = true;
+            break;
+        }
+    }
+    assert!(
+        notified,
+        "expected a periodic progress notification for a progress_notify watcher",
     );
 
     h.stop().await;

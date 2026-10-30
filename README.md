@@ -163,6 +163,21 @@ notification and has to re-list. Size `history_capacity` accordingly: it
 bounds how far behind a watcher may fall before it is compacted, and every
 entry keeps a copy of the key and of the value in memory.
 
+### Progress notifications
+
+netcd issues **one global revision** per mutation, while the
+`kube-apiserver` watch cache tracks the revision of the resource it
+watches. A resource that is not being written therefore leaves its cache
+behind the store revision, and every request for a fresh resource version
+times out with `Too large resource version: X, current: Y`.
+
+etcd closes that gap with *progress notifications*: an empty `WatchResponse`
+whose header carries the current revision. The apiserver asks for them
+through the `RequestProgress` RPC of the Watch service (every 100 ms while
+a cache waits for freshness), and netcd pushes one to every watcher. A
+watcher created with `progress_notify = true` also gets one every 10
+seconds.
+
 ## Configuration
 
 The config file (`config.json` by default, override with `--config` or

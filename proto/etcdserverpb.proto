@@ -74,6 +74,20 @@ service Watch {
         body: "*"
     };
   }
+
+  // RequestProgress asks the server to send a progress notification to all
+  // the watchers it currently serves. A progress notification is a
+  // WatchResponse without any event whose header carries the current
+  // revision. The kube-apiserver uses it to refresh the resource version of
+  // its watch caches: without it a cache whose resource is not being
+  // written stays behind the store revision, and every request for a fresh
+  // resource version times out with "Too large resource version".
+  rpc RequestProgress(RequestProgressRequest) returns (RequestProgressResponse) {
+      option (google.api.http) = {
+        post: "/v3/watch/progress"
+        body: "*"
+    };
+  }
 }
 
 service Lease {
@@ -686,6 +700,17 @@ message WatchRequest {
     WatchCancelRequest cancel_request = 2;
     WatchProgressRequest progress_request = 3;
   }
+}
+
+// RequestProgressRequest asks the server to send a progress notification to
+// all the watchers it currently serves.
+message RequestProgressRequest {
+}
+
+// RequestProgressResponse carries the revision the progress notifications
+// were sent at.
+message RequestProgressResponse {
+  ResponseHeader header = 1;
 }
 
 message WatchCreateRequest {

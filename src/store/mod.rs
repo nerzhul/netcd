@@ -42,6 +42,21 @@ pub struct EvictEntry {
     pub rev: u64,
 }
 
+/// What the store pushes to a watch stream.
+#[derive(Debug, Clone)]
+pub enum WatchMessage {
+    /// A mutation the watcher asked for.
+    Event(WatchEvent),
+    /// A progress notification: no event, the revision is the current one.
+    ///
+    /// The kube-apiserver uses those to refresh the resource version of its
+    /// watch caches. A cache whose resource is not being written would
+    /// otherwise stay behind the store revision, and every request for a
+    /// fresh resource version would time out with `Too large resource
+    /// version: X, current: Y`.
+    Progress { rev: u64 },
+}
+
 /// A live Watch subscription, keyed by `watch_id`.
 pub struct WatchHandle {
     pub id: i64,
@@ -53,7 +68,7 @@ pub struct WatchHandle {
     /// `prev_kv` requested?
     pub prev_kv: bool,
     /// Sender half of the event channel. Cloning is cheap (mpsc).
-    pub sender: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
+    pub sender: tokio::sync::mpsc::UnboundedSender<WatchMessage>,
 }
 
 pub struct Store {
@@ -128,7 +143,7 @@ impl Store {
         key: Bytes,
         range_end: Bytes,
         prev_kv: bool,
-        sender: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
+        sender: tokio::sync::mpsc::UnboundedSender<WatchMessage>,
         with_history: bool,
     ) -> (i64, Vec<Mutation>) {
         let _commit = self.write_lock.lock();
@@ -469,10 +484,27 @@ impl Store {
             if !watch_matches(w, &m.key) {
                 continue;
             }
-            let _ = w
-                .sender
-                .send(WatchEvent::from_mutation(m.clone(), w.prev_kv));
+            let _ = w.sender.send(WatchMessage::Event(WatchEvent::from_mutation(
+                m.clone(),
+                w.prev_kv,
+            )));
         }
+    }
+
+    /// Send a progress notification to every live watcher and return the
+    /// revision it carries.
+    ///
+    /// The kube-apiserver calls `RequestProgress` when one of its watch
+    /// caches waits for a fresher revision. The notification lets the cache
+    /// jump to the current revision instead of staying behind on resources
+    /// that are not being written.
+    pub fn broadcast_progress(&self) -> u64 {
+        let rev = self.current_rev();
+        let g = self.watches.lock();
+        for w in g.values() {
+            let _ = w.sender.send(WatchMessage::Progress { rev });
+        }
+        rev
     }
 }
 
@@ -694,6 +726,26 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_progress_reaches_every_watcher() {
+        let s = Store::new(1024, 100);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.register_watch(
+            Bytes::from_static(b"/"),
+            Bytes::from_static(b"\x00"),
+            false,
+            tx,
+            false,
+        );
+
+        let rev = s.broadcast_progress();
+        assert_eq!(rev, s.current_rev());
+        match rx.try_recv().expect("a progress message") {
+            WatchMessage::Progress { rev: notified } => assert_eq!(notified, rev),
+            other => panic!("expected a progress message, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn watch_events_are_delivered_in_revision_order() {
         // Concurrent writers must not fan their events out out of order: the
         // apiserver's watch cache assigns its resource version from the
@@ -729,8 +781,10 @@ mod tests {
         }
 
         let mut revs = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            revs.push(ev.rev);
+        while let Ok(msg) = rx.try_recv() {
+            if let WatchMessage::Event(ev) = msg {
+                revs.push(ev.rev);
+            }
         }
         assert_eq!(revs.len(), 400);
         assert!(

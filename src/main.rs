@@ -336,9 +336,7 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
             auth.clone(),
             Duration::from_secs(config.server_max_ttl_seconds.max(1) as u64),
             config.history_capacity,
-            Duration::from_secs(
-                (config.server_max_ttl_seconds.max(60) / 10) as u64,
-            ),
+            netcd::services::watch::DEFAULT_PROGRESS_INTERVAL,
             opts,
         ) => {
             if let Err(e) = r {
