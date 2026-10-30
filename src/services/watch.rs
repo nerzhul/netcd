@@ -192,22 +192,19 @@ async fn handle_create(
         }
     }
 
-    let watch_id = store.alloc_watch_id();
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
 
-    {
-        let mut g = store.watches.lock();
-        g.insert(
-            watch_id,
-            crate::store::WatchHandle {
-                id: watch_id,
-                key: key.clone(),
-                range_end: range_end.clone(),
-                prev_kv,
-                sender: watch_tx,
-            },
-        );
-    }
+    // Register the watch and snapshot the history in one critical section:
+    // a mutation fanned out between the two would be delivered after the
+    // replayed (older) events and the watcher would see revisions going
+    // backwards.
+    let (watch_id, history) = store.register_watch(
+        key.clone(),
+        range_end.clone(),
+        prev_kv,
+        watch_tx,
+        start_revision > 0,
+    );
     active.lock().push(watch_id);
 
     tx.send(Ok(WatchResponse {
@@ -219,20 +216,17 @@ async fn handle_create(
     .await
     .map_err(|e| Status::internal(e.to_string()))?;
 
-    if start_revision > 0 {
-        let snap = store.history.snapshot();
-        for m in snap {
-            if (m.rev as i64) < start_revision {
-                continue;
-            }
-            if !range_contains(&key, &range_end, &m.key) {
-                continue;
-            }
-            let ev = WatchEvent::from_mutation(m, prev_kv);
-            let resp = ev_to_response(&ev, watch_id);
-            if tx.send(Ok(resp)).await.is_err() {
-                break;
-            }
+    for m in history {
+        if (m.rev as i64) < start_revision {
+            continue;
+        }
+        if !range_contains(&key, &range_end, &m.key) {
+            continue;
+        }
+        let ev = WatchEvent::from_mutation(m, prev_kv);
+        let resp = ev_to_response(&ev, watch_id);
+        if tx.send(Ok(resp)).await.is_err() {
+            break;
         }
     }
 

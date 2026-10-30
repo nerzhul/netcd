@@ -133,6 +133,36 @@ The apiserver's client cert SHA-256 fingerprint must appear in
 operations to be allowed. See [docs/api.md](docs/api.md) for how to add a
 tenant at runtime.
 
+### Revision semantics
+
+netcd issues one revision per mutation and never reuses one. It has **no
+MVCC store**, which changes what a `Range` at a given revision returns:
+
+| Requested revision    | netcd behaviour                                                                                                     |
+|-----------------------|----------------------------------------------------------------------------------------------------------------------|
+| `0` (unset)           | The current state.                                                                                                  |
+| `<= current revision` | The current state as well: netcd cannot rebuild a historical state, so it serves the newest one and advertises the current revision in the response header. |
+| `> current revision`  | Rejected with `OutOfRange` and etcd's exact message `etcdserver: mvcc: required revision is a future revision`, so the apiserver recognises it as `ErrFutureRev`. |
+
+Serving historical revisions matters for `kube-apiserver`: its reflector
+relists at the exact revision it last synced (`lastSyncResourceVersion`),
+so refusing anything but the current revision used to break the watch cache
+and made every client request for a fresh resource version time out with
+`Too large resource version: X, current: Y`.
+
+Watch events are always delivered in **increasing revision order**, including
+under concurrent writers: the revision allocation, the state update and the
+fan-out to the watchers happen in a single critical section. The apiserver's
+watch cache assigns its resource version from the events it receives, so a
+single out-of-order event would move it backwards and it would never reach
+the "fresh" state again.
+
+A watcher asking for a revision the history ring buffer no longer holds
+(`start_revision <= compacted_rev`) gets a one-shot `compact_revision`
+notification and has to re-list. Size `history_capacity` accordingly: it
+bounds how far behind a watcher may fall before it is compacted, and every
+entry keeps a copy of the key and of the value in memory.
+
 ## Configuration
 
 The config file (`config.json` by default, override with `--config` or

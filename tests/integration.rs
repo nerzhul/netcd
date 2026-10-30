@@ -753,3 +753,94 @@ async fn watch_below_oldest_history_returns_compact_notification() {
 
     h.stop().await;
 }
+
+// A third class of bug: the apiserver's reflector relists at the exact
+// revision it last synced (`lastSyncResourceVersion`), and netcd used to
+// reject every revision but the current one. The List failed, the watch
+// cache never refreshed and every client request for a fresh resource
+// version timed out with `Too large resource version: X, current: Y`.
+
+#[tokio::test]
+async fn range_at_an_older_revision_serves_the_current_state() {
+    let h = Harness::start().await;
+    let mut kv = h.kv_client().await;
+    kv.put(PutRequest {
+        key: b"/registry/events/team-a/x".to_vec(),
+        value: b"v1".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let synced = kv
+        .range(RangeRequest {
+            key: b"/registry/events/team-a/x".to_vec(),
+            range_end: vec![],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .header
+        .expect("header")
+        .revision;
+
+    // A second write moves the current revision forward, the synced
+    // revision is now in the past.
+    kv.put(PutRequest {
+        key: b"/registry/events/team-a/y".to_vec(),
+        value: b"v2".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let resp = kv
+        .range(RangeRequest {
+            key: b"/registry/events/team-a/".to_vec(),
+            range_end: b"/registry/events/team-a0".to_vec(),
+            revision: synced,
+            ..Default::default()
+        })
+        .await
+        .expect("a range at an older revision must be served")
+        .into_inner();
+    assert_eq!(resp.kvs.len(), 2, "the current state must be returned");
+    assert!(
+        resp.header.expect("header").revision >= synced,
+        "the response header must advertise the current revision",
+    );
+
+    h.stop().await;
+}
+
+#[tokio::test]
+async fn range_at_a_future_revision_is_rejected_like_etcd() {
+    let h = Harness::start().await;
+    let mut kv = h.kv_client().await;
+    kv.put(PutRequest {
+        key: b"/registry/events/team-a/x".to_vec(),
+        value: b"v".to_vec(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    let err = kv
+        .range(RangeRequest {
+            key: b"/registry/events/team-a/x".to_vec(),
+            range_end: vec![],
+            revision: 1_000_000,
+            ..Default::default()
+        })
+        .await
+        .expect_err("a future revision must be rejected");
+    assert_eq!(err.code(), tonic::Code::OutOfRange);
+    // The apiserver matches this message to recognise `ErrFutureRev` and
+    // answer with a proper `Too large resource version` error.
+    assert_eq!(
+        err.message(),
+        "etcdserver: mvcc: required revision is a future revision",
+    );
+
+    h.stop().await;
+}

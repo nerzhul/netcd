@@ -59,6 +59,21 @@ pub struct WatchHandle {
 pub struct Store {
     /// Monotonic revision; starts at 1.
     pub rev: AtomicRevision,
+    /// Serialises the mutation critical section.
+    ///
+    /// A mutation allocates its revision, updates the state and fans the
+    /// event out to the watchers. Without this lock two concurrent writers
+    /// can allocate revisions `R` and `R+1` but fan `R+1` out first:
+    /// watchers would see revisions going backwards. The apiserver's watch
+    /// cache assigns its resource version unconditionally, so a single
+    /// out-of-order event moves the cache backwards and it never reaches the
+    /// "fresh" state again - every client request for a recent resource
+    /// version then times out with `Too large resource version: X, current:
+    /// Y`.
+    ///
+    /// etcd serialises its writes the same way (through raft), so this
+    /// matches the upstream ordering guarantees.
+    write_lock: Mutex<()>,
     /// Sum of `key.len() + value.len()` for all live entries.
     pub bytes_used: std::sync::atomic::AtomicU64,
     /// Main KV map.
@@ -83,6 +98,7 @@ impl Store {
     pub fn new(max_cache_bytes: u64, history_capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             rev: AtomicRevision::new(1),
+            write_lock: Mutex::new(()),
             bytes_used: std::sync::atomic::AtomicU64::new(0),
             kv: RwLock::new(BTreeMap::new()),
             eviction: Mutex::new(VecDeque::new()),
@@ -96,8 +112,43 @@ impl Store {
     }
 
     /// Allocate a new watch id.
-    pub fn alloc_watch_id(&self) -> i64 {
+    fn alloc_watch_id(&self) -> i64 {
         self.next_watch_id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Register a watch and, when the watcher needs the history, snapshot
+    /// it in the same critical section. Returns the watch id and the
+    /// history snapshot (empty when `with_history` is false).
+    ///
+    /// The snapshot and the registration must be atomic: a mutation fanned
+    /// out between the two would be delivered *after* the replayed (older)
+    /// events, and the watcher would see revisions going backwards.
+    pub fn register_watch(
+        &self,
+        key: Bytes,
+        range_end: Bytes,
+        prev_kv: bool,
+        sender: tokio::sync::mpsc::UnboundedSender<WatchEvent>,
+        with_history: bool,
+    ) -> (i64, Vec<Mutation>) {
+        let _commit = self.write_lock.lock();
+        let history = if with_history {
+            self.history.snapshot()
+        } else {
+            Vec::new()
+        };
+        let watch_id = self.alloc_watch_id();
+        self.watches.lock().insert(
+            watch_id,
+            WatchHandle {
+                id: watch_id,
+                key,
+                range_end,
+                prev_kv,
+                sender,
+            },
+        );
+        (watch_id, history)
     }
 
     /// Snapshot the current revision.
@@ -115,6 +166,10 @@ impl Store {
         if key.is_empty() {
             return Err(StoreError::InvalidArgument("key must not be empty".into()));
         }
+        // The whole mutation - revision allocation, state update, eviction
+        // and fan-out - runs in one critical section so watchers always see
+        // revisions in increasing order.
+        let _commit = self.write_lock.lock();
         let new_rev = self.rev.next();
         let new_size = (key.len() + value.len()) as u64;
 
@@ -184,8 +239,10 @@ impl Store {
             self.compacted_rev.fetch_max(dropped, Ordering::Relaxed);
         }
 
-        // Evict opportunistically.
-        self.evict_to_capacity();
+        // Evict opportunistically. Evictions allocate revisions too, they
+        // must stay in the same critical section to keep the watch stream
+        // ordered.
+        self.evict_to_capacity_locked();
 
         // Fan out to watchers.
         self.fanout(m);
@@ -212,6 +269,7 @@ impl Store {
         if key.is_empty() {
             return Err(StoreError::InvalidArgument("key must not be empty".into()));
         }
+        let _commit = self.write_lock.lock();
         let entry = {
             let mut kv = self.kv.write();
             kv.remove(&key)
@@ -250,6 +308,22 @@ impl Store {
     /// of `b"\x00"` is treated as "to the end"; empty `range_end` is
     /// equivalent to a single key.
     ///
+    /// `revision` follows the etcd semantics:
+    ///
+    ///   * `0` - the latest state.
+    ///   * `<= current_rev` - the latest state as well. netcd has no MVCC
+    ///     store, a historical revision cannot be served, so the current
+    ///     state is returned and the response header advertises the current
+    ///     revision. Refusing those revisions broke the apiserver: its
+    ///     reflector relists at an exact revision (`lastSyncResourceVersion`)
+    ///     as soon as it has synced once, the List failed, the watch cache
+    ///     never refreshed and every client request for a fresh resource
+    ///     version timed out with `Too large resource version: X, current: Y`.
+    ///   * `> current_rev` - rejected, like etcd does for a future
+    ///     revision. The message must match etcd's byte for byte, the
+    ///     apiserver matches on it to recognise `ErrFutureRev` and answer
+    ///     with a proper `Too large resource version` error.
+    ///
     /// `range_end` may also be in the "key + 1" form produced by
     /// `etcdctl --prefix` and the etcd v3 client's `WithPrefix()`:
     /// `getPrefix(key)` returns `key` with the rightmost byte that is
@@ -265,13 +339,15 @@ impl Store {
         limit: i64,
         revision: i64,
     ) -> Result<Vec<(Bytes, Entry)>, StoreError> {
-        if revision != 0 && revision != self.current_rev() as i64 {
-            return Err(StoreError::OutOfRange(format!(
-                "min_rev={} max_rev={} requested={}",
-                self.compacted_rev.load(Ordering::Relaxed),
-                self.current_rev(),
-                revision
+        if revision < 0 {
+            return Err(StoreError::InvalidArgument(format!(
+                "invalid revision {revision}"
             )));
+        }
+        if revision > self.current_rev() as i64 {
+            return Err(StoreError::OutOfRange(
+                "etcdserver: mvcc: required revision is a future revision".into(),
+            ));
         }
         let kv = self.kv.read();
         let mut out = Vec::new();
@@ -332,6 +408,12 @@ impl Store {
     /// Evict from the front of the queue until
     /// `bytes_used <= max_cache_bytes`. No-op if under the limit.
     pub fn evict_to_capacity(&self) {
+        let _commit = self.write_lock.lock();
+        self.evict_to_capacity_locked();
+    }
+
+    /// Eviction, assuming the caller already holds `write_lock`.
+    fn evict_to_capacity_locked(&self) {
         let cap = self.max_cache_bytes;
         loop {
             let used = self.bytes_used.load(Ordering::Relaxed);
@@ -564,5 +646,96 @@ mod tests {
         .unwrap();
         let got = s.range(b"/foo/", b"\x00", 0, 0).unwrap();
         assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn range_at_an_older_revision_serves_the_current_state() {
+        // The apiserver's reflector relists at the exact revision it last
+        // synced, so a range at an older revision must be served. netcd has
+        // no MVCC store, the current state is returned instead.
+        let s = Store::new(1024, 100);
+        s.put(
+            Bytes::from_static(b"/foo/a"),
+            Bytes::from_static(b"v-a"),
+            None,
+        )
+        .unwrap();
+        let synced = s.current_rev() as i64;
+        s.put(
+            Bytes::from_static(b"/foo/b"),
+            Bytes::from_static(b"v-b"),
+            None,
+        )
+        .unwrap();
+
+        let got = s.range(b"/foo/", b"\x00", 0, synced).unwrap();
+        assert_eq!(got.len(), 2, "an older revision must still be served");
+    }
+
+    #[test]
+    fn range_at_a_future_revision_is_rejected_like_etcd() {
+        let s = Store::new(1024, 100);
+        s.put(
+            Bytes::from_static(b"/foo/a"),
+            Bytes::from_static(b"v-a"),
+            None,
+        )
+        .unwrap();
+        let future = s.current_rev() as i64 + 1;
+
+        let err = s.range(b"/foo/", b"\x00", 0, future).unwrap_err();
+        match err {
+            StoreError::OutOfRange(msg) => assert_eq!(
+                msg, "etcdserver: mvcc: required revision is a future revision",
+                "the apiserver matches this message to detect ErrFutureRev",
+            ),
+            other => panic!("expected an out of range error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_events_are_delivered_in_revision_order() {
+        // Concurrent writers must not fan their events out out of order: the
+        // apiserver's watch cache assigns its resource version from the
+        // events it receives, an out-of-order event moves it backwards and
+        // the cache never reaches the "fresh" state again.
+        let s = Store::new(1024 * 1024, 10_000);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        s.register_watch(
+            Bytes::from_static(b"/"),
+            Bytes::from_static(b"\x00"),
+            false,
+            tx,
+            false,
+        );
+
+        let writers: Vec<_> = (0..8)
+            .map(|i| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for j in 0..50 {
+                        s.put(
+                            Bytes::from(format!("/k/{i}/{j}")),
+                            Bytes::from_static(b"v"),
+                            None,
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+
+        let mut revs = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            revs.push(ev.rev);
+        }
+        assert_eq!(revs.len(), 400);
+        assert!(
+            revs.windows(2).all(|w| w[0] < w[1]),
+            "watch revisions must strictly increase: {revs:?}",
+        );
     }
 }
