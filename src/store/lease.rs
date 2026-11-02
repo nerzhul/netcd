@@ -32,6 +32,13 @@ use bytes::Bytes;
 /// lifetime close to the granted one.
 pub const DEFAULT_EXPIRY_TICK: Duration = Duration::from_secs(1);
 
+/// How many expiry ticks between two heap trims.
+///
+/// The trim walks the allocator's free lists and gives the pages back to
+/// the kernel, which is not free. Once every 30 s is enough for the
+/// resident set to follow the real usage of an idle server.
+pub const TRIM_EVERY_TICKS: u32 = 30;
+
 /// One active lease.
 #[derive(Debug)]
 pub struct LeaseEntry {
@@ -208,6 +215,11 @@ pub fn spawn_expiry_loop(store: Arc<Store>, tick: Duration) {
     tokio::spawn(async move {
         let mut t = interval(tick);
         t.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // The heap is trimmed every `TRIM_EVERY_TICKS` ticks: glibc keeps
+        // the freed pages in its arena, so the resident set of the
+        // process would stay at its high-water mark after a burst of
+        // events was purged.
+        let mut ticks_since_trim: u32 = 0;
         loop {
             t.tick().await;
             let expired = store.leases.collect_expired();
@@ -217,6 +229,14 @@ pub fn spawn_expiry_loop(store: Arc<Store>, tick: Duration) {
                     let _ = store.delete_with_event(k, MutationKind::DeleteLease);
                 }
             }
+            ticks_since_trim += 1;
+            if ticks_since_trim >= TRIM_EVERY_TICKS {
+                ticks_since_trim = 0;
+                crate::alloc::trim_heap();
+            }
+            // Periodic housekeeping: release the payloads of the deleted
+            // keys, compact the eviction queue.
+            store.housekeeping();
         }
     });
 }

@@ -3,6 +3,7 @@
 
 pub mod acl;
 pub mod admin;
+pub mod alloc;
 pub mod auth;
 pub mod config;
 pub mod error;

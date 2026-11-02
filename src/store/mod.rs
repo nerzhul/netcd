@@ -3,6 +3,7 @@
 pub mod history;
 pub mod lease;
 pub mod revision;
+pub mod secure;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::Ordering;
@@ -16,6 +17,7 @@ use crate::services::watch::WatchEvent;
 use crate::store::history::{HistoryBuffer, Mutation};
 use crate::store::lease::LeaseTable;
 use crate::store::revision::AtomicRevision;
+use crate::store::secure::SecureBytes;
 
 /// Distinguish Put vs Delete in the mutation event stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +29,12 @@ pub enum MutationKind {
 
 #[derive(Debug, Clone)]
 pub struct Entry {
-    pub value: Bytes,
+    /// The payload.
+    ///
+    /// A [`SecureBytes`], not a plain buffer: the payload is wiped when
+    /// the key is deleted, so a deleted event does not stay readable in
+    /// the process' heap.
+    pub value: SecureBytes,
     pub create_rev: u64,
     pub mod_rev: u64,
     pub lease_id: Option<i64>,
@@ -41,6 +48,12 @@ pub struct EvictEntry {
     pub size: u64,
     pub rev: u64,
 }
+
+/// Floor for the FIFO eviction queue compaction.
+///
+/// Below that many entries the queue is cheap to keep, and a compaction
+/// pass would cost more than what it saves.
+const EVICTION_QUEUE_SLACK: usize = 1024;
 
 /// What the store pushes to a watch stream.
 #[derive(Debug, Clone)]
@@ -111,6 +124,18 @@ pub struct Store {
     pub compacted_rev: std::sync::atomic::AtomicU64,
     /// Configured capacity for `max_cache_bytes`.
     pub max_cache_bytes: u64,
+    /// Number of live keys.
+    ///
+    /// Mirrors `kv.len()`. Kept as an atomic so the hot path can decide
+    /// whether the eviction queue needs a compaction pass without
+    /// taking the `kv` lock.
+    ///
+    /// It has to be exact: the compaction pass is triggered by comparing
+    /// it with the queue length, and a stale value would make the pass
+    /// run on every single write.
+    live_keys: std::sync::atomic::AtomicUsize,
+    /// Number of entries in the FIFO eviction queue.
+    eviction_len: std::sync::atomic::AtomicUsize,
     /// Next watch id.
     next_watch_id: std::sync::atomic::AtomicI64,
 }
@@ -128,6 +153,8 @@ impl Store {
             watches: Mutex::new(HashMap::new()),
             compacted_rev: std::sync::atomic::AtomicU64::new(0),
             max_cache_bytes,
+            live_keys: std::sync::atomic::AtomicUsize::new(0),
+            eviction_len: std::sync::atomic::AtomicUsize::new(0),
             next_watch_id: std::sync::atomic::AtomicI64::new(0),
         })
     }
@@ -196,7 +223,12 @@ impl Store {
     }
 
     /// Put (insert or upsert) a key. Returns the new revision.
-    pub fn put(&self, key: Bytes, value: Bytes, lease_id: Option<i64>) -> Result<u64, StoreError> {
+    pub fn put(
+        &self,
+        key: Bytes,
+        value: SecureBytes,
+        lease_id: Option<i64>,
+    ) -> Result<u64, StoreError> {
         if key.is_empty() {
             return Err(StoreError::InvalidArgument("key must not be empty".into()));
         }
@@ -219,6 +251,9 @@ impl Store {
         let old_size = {
             let mut kv = self.kv.write();
             let old = kv.get(&key).map(|e| e.size);
+            if old.is_none() {
+                self.live_keys.fetch_add(1, Ordering::Relaxed);
+            }
             kv.insert(
                 key.clone(),
                 Entry {
@@ -242,6 +277,7 @@ impl Store {
                 size: new_size,
                 rev: new_rev,
             });
+            self.eviction_len.store(ev.len(), Ordering::Relaxed);
         }
 
         // Update byte counter.
@@ -265,7 +301,7 @@ impl Store {
             rev: new_rev,
             kind: MutationKind::Put,
             key: key.clone(),
-            value: value.clone(),
+            value: Some(value.clone()),
             create_rev,
             lease_id,
         };
@@ -312,16 +348,20 @@ impl Store {
             Some(e) => e,
             None => return Ok((self.current_rev(), 0)),
         };
+        self.live_keys.fetch_sub(1, Ordering::Relaxed);
         self.bytes_used.fetch_sub(entry.size, Ordering::Relaxed);
         // Detach from any lease.
         let _ = self.leases.detach(&key);
+        // The store drops its reference to the payload here, when
+        // `entry` goes out of scope. The watch history ring may still
+        // hold one; `sweep_dead_payloads` drops it.
 
         let new_rev = self.rev.next();
         let m = Mutation {
             rev: new_rev,
             kind,
             key: key.clone(),
-            value: Bytes::new(),
+            value: None,
             create_rev: entry.create_rev,
             lease_id: entry.lease_id,
         };
@@ -446,19 +486,61 @@ impl Store {
         self.evict_to_capacity_locked();
     }
 
+    /// Drop the payloads the watch history ring still holds for keys
+    /// that are gone.
+    ///
+    /// The ring keeps the payload of the mutations it holds, because a
+    /// late watcher needs the value of the events it replays. When the
+    /// key is deleted, that payload must not stay readable in the
+    /// process' memory: the ring drops its reference here, and the last
+    /// one to go wipes the buffer.
+    ///
+    /// The sweep runs under the write lock, so it cannot race with a
+    /// write: a key that is recreated while the sweep runs keeps its
+    /// payload.
+    ///
+    /// Cost: one pass over the ring, with a lookup per entry. The
+    /// background task runs it once per second, so it never shows up on
+    /// the write path.
+    pub fn sweep_dead_payloads(&self) {
+        let _commit = self.write_lock.lock();
+        let kv = self.kv.read();
+        self.history
+            .release_dead_payloads(|key| kv.get(key).is_some());
+    }
+
+    /// Drop the dead entries of the FIFO eviction queue.
+    ///
+    /// An entry is dead when the key it points at is gone, or when the
+    /// live version of that key has a different revision (the entry
+    /// describes a version that has been overwritten). The live entries
+    /// keep their relative order, so the FIFO eviction order is
+    /// preserved.
+    ///
+    /// The queue only grows when the store is under its byte ceiling,
+    /// which is the normal case for an idle cluster: without this, the
+    /// queue would keep one entry per write, forever.
+    pub fn compact_eviction_queue(&self) {
+        let _commit = self.write_lock.lock();
+        self.compact_eviction_queue_locked();
+    }
+
     /// Eviction, assuming the caller already holds `write_lock`.
     fn evict_to_capacity_locked(&self) {
         let cap = self.max_cache_bytes;
         loop {
             let used = self.bytes_used.load(Ordering::Relaxed);
             if used <= cap {
-                return;
+                break;
             }
             let front = {
                 let mut ev = self.eviction.lock();
                 match ev.pop_front() {
-                    Some(f) => f,
-                    None => return,
+                    Some(f) => {
+                        self.eviction_len.store(ev.len(), Ordering::Relaxed);
+                        f
+                    }
+                    None => break,
                 }
             };
             let removed: Option<Entry> = {
@@ -474,14 +556,17 @@ impl Store {
                 }
             };
             if let Some(e) = removed {
+                self.live_keys.fetch_sub(1, Ordering::Relaxed);
                 self.bytes_used.fetch_sub(e.size, Ordering::Relaxed);
                 let _ = self.leases.detach(&front.key);
+                // Same as an explicit delete: the payload must not stay
+                // readable once the key is gone.
                 let new_rev = self.rev.next();
                 let m = Mutation {
                     rev: new_rev,
                     kind: MutationKind::Delete,
                     key: front.key.clone(),
-                    value: Bytes::new(),
+                    value: None,
                     create_rev: e.create_rev,
                     lease_id: e.lease_id,
                 };
@@ -492,6 +577,48 @@ impl Store {
                 tracing::debug!(key = ?front.key, "evicted by capacity");
             }
         }
+        // The queue only grows when the store is under its byte ceiling,
+        // which is the normal case for an idle cluster: entries whose key
+        // has been overwritten or deleted in the meantime are dead
+        // weight. Drop them so the queue stays proportional to the
+        // number of *live* keys instead of the number of writes.
+        self.compact_eviction_queue_locked();
+    }
+
+    /// Drop the dead entries of the FIFO eviction queue.
+    ///
+    /// Cost: one pass over the queue, amortised over the writes that
+    /// happened since the last pass - a pass always removes at least
+    /// half of the entries when the queue outgrew the live keys.
+    fn compact_eviction_queue_locked(&self) {
+        // Lock-free pre-check: two relaxed atomic loads instead of two
+        // lock acquisitions on every single write.
+        let queued = self.eviction_len.load(Ordering::Relaxed);
+        let live = self.live_keys.load(Ordering::Relaxed);
+        // Twice the live keys, with a floor: a queue that stays small
+        // absolute is not worth a pass.
+        let limit = live.saturating_mul(2).max(EVICTION_QUEUE_SLACK);
+        if queued <= limit {
+            return;
+        }
+        let mut ev = self.eviction.lock();
+        if ev.len() <= limit {
+            return;
+        }
+        let kv = self.kv.read();
+        ev.retain(|e| kv.get(&e.key).is_some_and(|cur| cur.mod_rev == e.rev));
+        self.eviction_len.store(ev.len(), Ordering::Relaxed);
+    }
+
+    /// Run the periodic housekeeping: release the payloads of the
+    /// deleted keys, compact the eviction queue.
+    ///
+    /// Called by the background task. Everything here is O(ring) and
+    /// happens at most once per second, so it never shows up on the
+    /// write path.
+    pub fn housekeeping(&self) {
+        self.sweep_dead_payloads();
+        self.compact_eviction_queue();
     }
 
     /// Fan a mutation out to all live watchers whose range covers
@@ -612,19 +739,19 @@ mod tests {
         let s = Store::new(1024, 100);
         s.put(
             Bytes::from_static(b"/foo/a"),
-            Bytes::from_static(b"v-a"),
+            SecureBytes::from(b"v-a"),
             None,
         )
         .unwrap();
         s.put(
             Bytes::from_static(b"/foo/b"),
-            Bytes::from_static(b"v-b"),
+            SecureBytes::from(b"v-b"),
             None,
         )
         .unwrap();
         s.put(
             Bytes::from_static(b"/foo/c"),
-            Bytes::from_static(b"v-c"),
+            SecureBytes::from(b"v-c"),
             None,
         )
         .unwrap();
@@ -649,18 +776,18 @@ mod tests {
         // partial replay and no compact notification. The fix is to
         // bump `compacted_rev` to the dropped rev on every eviction.
         let s = Store::new(1024, 3);
-        s.put(Bytes::from_static(b"a"), Bytes::from_static(b"1"), None)
+        s.put(Bytes::from_static(b"a"), SecureBytes::from(b"1"), None)
             .unwrap();
-        s.put(Bytes::from_static(b"b"), Bytes::from_static(b"2"), None)
+        s.put(Bytes::from_static(b"b"), SecureBytes::from(b"2"), None)
             .unwrap();
-        s.put(Bytes::from_static(b"c"), Bytes::from_static(b"3"), None)
+        s.put(Bytes::from_static(b"c"), SecureBytes::from(b"3"), None)
             .unwrap();
         // Buffer is now [a=rev2, b=rev3, c=rev4] (rev 1 is reserved
         // and never goes into history). compacted_rev is still 0.
         assert_eq!(s.compacted_rev.load(Ordering::Relaxed), 0);
 
         // One more Put evicts rev 2 (the oldest history entry).
-        s.put(Bytes::from_static(b"d"), Bytes::from_static(b"4"), None)
+        s.put(Bytes::from_static(b"d"), SecureBytes::from(b"4"), None)
             .unwrap();
         assert_eq!(
             s.compacted_rev.load(Ordering::Relaxed),
@@ -669,7 +796,7 @@ mod tests {
         );
 
         // Another Put evicts rev 3.
-        s.put(Bytes::from_static(b"e"), Bytes::from_static(b"5"), None)
+        s.put(Bytes::from_static(b"e"), SecureBytes::from(b"5"), None)
             .unwrap();
         assert_eq!(
             s.compacted_rev.load(Ordering::Relaxed),
@@ -687,7 +814,7 @@ mod tests {
         for i in 0..10u32 {
             s.put(
                 Bytes::from(format!("/k/{i}")),
-                Bytes::from_static(b"v"),
+                SecureBytes::from(b"v"),
                 None,
             )
             .unwrap();
@@ -695,7 +822,7 @@ mod tests {
         s.compacted_rev.store(50, Ordering::Relaxed);
         // One more Put drops the oldest, which has rev <= 10. The
         // fetch_max must keep compacted_rev at 50.
-        s.put(Bytes::from_static(b"/k/x"), Bytes::from_static(b"v"), None)
+        s.put(Bytes::from_static(b"/k/x"), SecureBytes::from(b"v"), None)
             .unwrap();
         assert_eq!(
             s.compacted_rev.load(Ordering::Relaxed),
@@ -709,13 +836,13 @@ mod tests {
         let s = Store::new(1024, 100);
         s.put(
             Bytes::from_static(b"/foo/a"),
-            Bytes::from_static(b"v-a"),
+            SecureBytes::from(b"v-a"),
             None,
         )
         .unwrap();
         s.put(
             Bytes::from_static(b"/foo/b"),
-            Bytes::from_static(b"v-b"),
+            SecureBytes::from(b"v-b"),
             None,
         )
         .unwrap();
@@ -731,14 +858,14 @@ mod tests {
         let s = Store::new(1024, 100);
         s.put(
             Bytes::from_static(b"/foo/a"),
-            Bytes::from_static(b"v-a"),
+            SecureBytes::from(b"v-a"),
             None,
         )
         .unwrap();
         let synced = s.current_rev() as i64;
         s.put(
             Bytes::from_static(b"/foo/b"),
-            Bytes::from_static(b"v-b"),
+            SecureBytes::from(b"v-b"),
             None,
         )
         .unwrap();
@@ -752,7 +879,7 @@ mod tests {
         let s = Store::new(1024, 100);
         s.put(
             Bytes::from_static(b"/foo/a"),
-            Bytes::from_static(b"v-a"),
+            SecureBytes::from(b"v-a"),
             None,
         )
         .unwrap();
@@ -877,7 +1004,7 @@ mod tests {
                     for j in 0..50 {
                         s.put(
                             Bytes::from(format!("/k/{i}/{j}")),
-                            Bytes::from_static(b"v"),
+                            SecureBytes::from(b"v"),
                             None,
                         )
                         .unwrap();
@@ -899,6 +1026,101 @@ mod tests {
         assert!(
             revs.windows(2).all(|w| w[0] < w[1]),
             "watch revisions must strictly increase: {revs:?}",
+        );
+    }
+
+    #[test]
+    fn the_live_key_count_matches_the_map() {
+        // The eviction queue compaction compares the queue length with
+        // the number of live keys. A wrong counter would make the
+        // compaction pass run on every write.
+        let s = Store::new(1024 * 1024, 100);
+        assert_eq!(s.live_keys.load(Ordering::Relaxed), 0);
+        for i in 0..10u32 {
+            s.put(
+                Bytes::from(format!("/k/{i}")),
+                SecureBytes::from(b"v".to_vec()),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.live_keys.load(Ordering::Relaxed), 10);
+        assert_eq!(s.live_keys.load(Ordering::Relaxed), s.kv.read().len());
+
+        // Overwriting a key does not create a new one.
+        s.put(
+            Bytes::from_static(b"/k/0"),
+            SecureBytes::from(b"v2".to_vec()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.live_keys.load(Ordering::Relaxed), 10);
+
+        s.delete(b"/k/0").unwrap();
+        assert_eq!(s.live_keys.load(Ordering::Relaxed), 9);
+        assert_eq!(s.live_keys.load(Ordering::Relaxed), s.kv.read().len());
+    }
+
+    #[test]
+    fn the_eviction_queue_stays_bounded() {
+        // Regression: the queue used to keep one entry per write, for
+        // ever, because it was only drained when the store went over its
+        // byte ceiling - which an idle cluster never does.
+        let s = Store::new(256 * 1024 * 1024, 100);
+        for i in 0..5_000u32 {
+            s.put(
+                Bytes::from(format!("/k/{i}")),
+                SecureBytes::from(b"v".to_vec()),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            s.eviction.lock().len(),
+            5_000,
+            "one entry per live key is expected",
+        );
+
+        // Delete everything, then let the housekeeping run.
+        let keys: Vec<Bytes> = s.kv.read().keys().cloned().collect();
+        for k in keys {
+            s.delete(&k).unwrap();
+        }
+        s.housekeeping();
+
+        assert_eq!(
+            s.eviction.lock().len(),
+            0,
+            "the queue must not keep the entries of the deleted keys",
+        );
+    }
+
+    #[test]
+    fn the_payload_of_a_deleted_key_is_released() {
+        // The watch history ring keeps the payload of the events it
+        // replays to late watchers. Once the key is gone, that payload
+        // must not stay readable in the process' memory.
+        let s = Store::new(1024 * 1024, 100);
+        s.put(
+            Bytes::from_static(b"/k"),
+            SecureBytes::from(b"confidential".to_vec()),
+            None,
+        )
+        .unwrap();
+
+        let snapshot = s.history.snapshot();
+        assert!(
+            snapshot[0].value.is_some(),
+            "the ring holds the payload while the key is alive",
+        );
+
+        s.delete(b"/k").unwrap();
+        s.housekeeping();
+
+        let snapshot = s.history.snapshot();
+        assert!(
+            snapshot[0].value.is_none(),
+            "the payload of the deleted key must be released",
         );
     }
 }

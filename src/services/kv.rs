@@ -24,6 +24,7 @@ use crate::proto::etcdserverpb::{
     RequestOp, ResponseOp, TxnRequest, TxnResponse,
 };
 use crate::proto::mvccpb;
+use crate::store::secure::SecureBytes;
 use crate::store::{MutationKind, Store};
 
 pub fn identity_for(_auth: &Authenticator) -> Identity {
@@ -90,7 +91,7 @@ impl etcdserverpb::kv_server::Kv for KvService {
         self.auth.authorise_key(&id, &req.key)?;
 
         let key = Bytes::from(req.key);
-        let value = Bytes::from(req.value);
+        let value = SecureBytes::from(req.value);
         let lease_id = if req.lease == 0 {
             None
         } else {
@@ -231,7 +232,7 @@ fn check_op_acl(auth: &Authenticator, id: &Identity, op: &RequestOp) -> Result<(
 fn eval_compare(store: &Store, c: &Compare) -> Result<bool, Status> {
     use crate::proto::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
     let entry = store.get(&c.key)?;
-    let cur_value: &[u8] = entry.as_ref().map(|e| e.value.as_ref()).unwrap_or(&[]);
+    let cur_value: &[u8] = entry.as_ref().map(|e| e.value.as_slice()).unwrap_or(&[]);
     let cur_rev: i64 = entry.as_ref().map(|e| e.mod_rev as i64).unwrap_or(0);
     let cur_version: i64 = entry.as_ref().map(|_| 1i64).unwrap_or(0);
     let cur_lease: i64 = entry.as_ref().map(|e| e.lease_id.unwrap_or(0)).unwrap_or(0);
@@ -293,7 +294,7 @@ fn apply_op(store: &Store, op: &RequestOp) -> Result<ResponseOp, Status> {
         }
         ReqOpVariant::RequestPut(p) => {
             let key = Bytes::from(p.key.clone());
-            let value = Bytes::from(p.value.clone());
+            let value = SecureBytes::from(p.value.clone());
             let lease = if p.lease == 0 { None } else { Some(p.lease) };
             let _ = store.put(key, value, lease)?;
             Ok(ResponseOp {

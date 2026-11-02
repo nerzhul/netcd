@@ -12,10 +12,28 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use netcd::admin::AdminState;
+#[cfg(feature = "scrub-alloc")]
+use netcd::alloc::ScrubbingAlloc;
 use netcd::auth::Authenticator;
 use netcd::config::{Config, ConfigRef, Overrides};
 use netcd::server::{build_and_serve, EtcdServerOptions};
 use netcd::store::Store;
+
+/// Overwrite every freed block before the allocator can hand it to
+/// somebody else.
+///
+/// The payloads netcd stores (Kubernetes `Event` objects) can carry
+/// confidential technical information. The store wipes its own copies
+/// when a key is deleted, but every copy that travels through the gRPC
+/// stack is a plain allocation; scrubbing the allocator closes those
+/// windows too.
+///
+/// The library does not install this: only the `netcd` binary does, so
+/// embedding the library in another program keeps that program's own
+/// allocator. Build with `--no-default-features` to opt out.
+#[cfg(feature = "scrub-alloc")]
+#[global_allocator]
+static GLOBAL_ALLOC: ScrubbingAlloc = ScrubbingAlloc;
 
 #[derive(Parser, Debug)]
 #[command(name = "netcd", version, about)]

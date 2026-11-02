@@ -16,6 +16,7 @@ use crate::proto::etcdserverpb::{
 };
 use crate::proto::mvccpb::{self, event::EventType, Event};
 use crate::store::history::Mutation;
+use crate::store::secure::SecureBytes;
 use crate::store::{MutationKind, Store, WatchMessage};
 
 /// How often a watcher that asked for `progress_notify` receives a progress
@@ -52,10 +53,10 @@ pub struct WatchEvent {
     pub rev: u64,
     pub kind: MutationKind,
     pub key: Bytes,
-    pub value: Bytes,
+    pub value: SecureBytes,
     pub create_rev: u64,
     pub lease_id: Option<i64>,
-    pub prev_value: Option<Bytes>,
+    pub prev_value: Option<SecureBytes>,
 }
 
 impl WatchEvent {
@@ -64,10 +65,14 @@ impl WatchEvent {
             rev: m.rev,
             kind: m.kind,
             key: m.key,
-            value: m.value,
+            value: m.value.unwrap_or_default(),
             create_rev: m.create_rev,
             lease_id: m.lease_id,
-            prev_value: if prev_kv { Some(Bytes::new()) } else { None },
+            prev_value: if prev_kv {
+                Some(SecureBytes::empty())
+            } else {
+                None
+            },
         }
     }
 }

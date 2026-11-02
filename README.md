@@ -18,7 +18,12 @@ Wire-compatible with `kube-apiserver` (`--etcd-servers=https://netcd:2379`).
   *renewed* with, so a client asking for less than the cap gets exactly
   the lifetime it asked for (see [Lease TTL semantics](#lease-ttl-semantics)).
 - **Bounded cache by bytes** (`key.len() + value.len()`); FIFO eviction by
-  insertion order, not LRU.
+  insertion order, not LRU. The eviction queue is compacted, so it stays
+  proportional to the number of live keys instead of growing with the
+  number of writes.
+- **Payloads are wiped on release.** A deleted event's payload does not
+  stay readable in the process' heap (see
+  [Memory hygiene](#memory-hygiene)).
 - **Multi-tenant mTLS RBAC**: client cert SHA-256 → tenant → allowed key
   prefixes. A request whose key/range falls outside the tenant's prefixes is
   rejected with `PermissionDenied`.
@@ -164,6 +169,37 @@ A watcher asking for a revision the history ring buffer no longer holds
 notification and has to re-list. Size `history_capacity` accordingly: it
 bounds how far behind a watcher may fall before it is compacted, and every
 entry keeps a copy of the key and of the value in memory.
+
+### Memory hygiene
+
+The payloads netcd stores are the Kubernetes `Event` objects the
+kube-apiserver writes. They can carry confidential technical information,
+so netcd does not leave them lying around in the process' heap:
+
+- **The store's own copies are wiped when they are released.** The
+  payload lives in a reference-counted buffer that overwrites itself with
+  zeros as soon as the last reference goes away - when the key is
+  deleted, when its lease expires, or when the cache evicts it.
+- **The watch history ring releases the payloads of the deleted keys.**
+  The ring keeps the value of the events it may have to replay to a late
+  watcher, so it holds a reference to the payload too. A background task
+  sweeps the ring once per second and drops the payloads whose key is
+  gone.
+- **Every freed block is scrubbed by the allocator.** The copies that
+  travel through the gRPC stack (prost decoding the request, the
+  `Vec<u8>` handed to the encoder, the encoded frame) are plain
+  allocations netcd does not own. The `netcd` binary installs a global
+  allocator that overwrites each block before handing it back. Build
+  with `--no-default-features` to opt out and use the system allocator.
+- **The resident set follows the real usage.** glibc keeps the freed
+  pages in its arena, so a process that just purged a burst of events
+  would keep the memory reserved. A background task calls
+  `malloc_trim(0)` every 30 s to give the pages back to the kernel.
+
+The cost is one `memset` per released payload. Measured on the event
+write path (200 000 events of 1 KiB), the throughput is unchanged
+compared to a store that keeps plain buffers, because the write path
+itself is dominated by the B-tree insert and the lock acquisitions.
 
 ### Lease TTL semantics
 
@@ -322,7 +358,7 @@ curl -X POST http://localhost:2378/v1/config/reload
 | Component         | Concurrency primitive             | Notes                                   |
 |-------------------|-----------------------------------|-----------------------------------------|
 | `kv`              | `parking_lot::RwLock<BTreeMap>`   | Cheap reads                             |
-| `eviction`        | `Mutex<VecDeque>`                 | FIFO of `(key, size, rev)`              |
+| `eviction`        | `Mutex<VecDeque>`                 | FIFO of `(key, size, rev)`, compacted   |
 | `history`         | `Mutex<VecDeque<Mutation>>`       | Bounded ring for late Watch joiners     |
 | `leases`          | `Mutex<HashMap<i64, LeaseEntry>>` | + background expiry task (1 s tick)     |
 | `watches`         | `Mutex<HashMap<i64, WatchHandle>>`| Per-stream mpsc sender (store owns it)  |
@@ -336,9 +372,17 @@ return `Result<T, tonic::Status>` without allocation on success.
 ## Testing
 
 ```bash
-cargo test              # 41 unit tests + 17 e2e integration tests + 5 build contract tests
+cargo test              # 52 unit tests + 18 e2e integration tests + 5 build contract tests
 cargo test --release    # slower to compile, faster to run
+
+# The event write path benchmark.
+cargo run --release --example bench_store -- 200000 1024
 ```
+
+The `scrub-alloc` feature is on by default: it installs a global
+allocator that overwrites every freed block, so a deleted event payload
+does not stay readable in the process' heap. Build with
+`--no-default-features` to use the system allocator instead.
 
 The integration tests build a real CA + server cert + client cert in
 process via `rcgen`, spin up a real `netcd` instance, and exercise
