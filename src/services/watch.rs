@@ -26,6 +26,26 @@ use crate::store::{MutationKind, Store, WatchMessage};
 /// watch cache has to be refreshed well before that.
 pub const DEFAULT_PROGRESS_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Spawn the background task that pushes periodic progress notifications
+/// to the watchers that asked for them.
+///
+/// One task for the whole server, not one ticker per watch: a per-watch
+/// ticker had to keep its own clone of the watch's sender alive, so a
+/// cancelled watch left the ticker running and the notification queue
+/// growing forever.
+pub fn spawn_progress_loop(store: Arc<Store>, period: Duration) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(period);
+        // The first tick of an interval completes immediately; drop it so
+        // no notification is sent right after the process starts.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            store.broadcast_progress_to_notified();
+        }
+    });
+}
+
 /// One fan-out event between the store and a single watch stream.
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
@@ -65,18 +85,11 @@ pub struct WatchService {
     pub store: Arc<Store>,
     #[allow(dead_code)]
     pub auth: Authenticator,
-    /// How often a watcher that asked for `progress_notify` receives a
-    /// progress notification.
-    pub progress_interval: Duration,
 }
 
 impl WatchService {
-    pub fn new(store: Arc<Store>, auth: Authenticator, progress_interval: Duration) -> Self {
-        Self {
-            store,
-            auth,
-            progress_interval,
-        }
+    pub fn new(store: Arc<Store>, auth: Authenticator) -> Self {
+        Self { store, auth }
     }
 }
 
@@ -91,7 +104,6 @@ impl etcdserverpb::watch_server::Watch for WatchService {
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<WatchResponse, Status>>(128);
         let store = self.store.clone();
-        let progress_interval = self.progress_interval;
 
         tokio::spawn(async move {
             let active: Arc<parking_lot::Mutex<Vec<i64>>> =
@@ -101,9 +113,7 @@ impl etcdserverpb::watch_server::Watch for WatchService {
             loop {
                 match in_stream.message().await {
                     Ok(Some(req)) => {
-                        if let Err(e) =
-                            handle_request(req, &store, &tx, &active, progress_interval).await
-                        {
+                        if let Err(e) = handle_request(req, &store, &tx, &active).await {
                             let _ = tx.send(Err(e)).await;
                         }
                     }
@@ -115,11 +125,10 @@ impl etcdserverpb::watch_server::Watch for WatchService {
                 }
             }
             let owned = active_for_cleanup.lock().clone();
-            {
-                let mut g = store.watches.lock();
-                for wid in owned {
-                    g.remove(&wid);
-                }
+            for wid in owned {
+                // Dropping the handle closes the watch's channel, which
+                // terminates the task forwarding its events.
+                store.remove_watch(wid);
             }
             debug!("watch stream closed");
         });
@@ -150,14 +159,13 @@ async fn handle_request(
     store: &Arc<Store>,
     tx: &mpsc::Sender<Result<WatchResponse, Status>>,
     active: &Arc<parking_lot::Mutex<Vec<i64>>>,
-    progress_interval: Duration,
 ) -> Result<(), Status> {
     let union = req
         .request_union
         .ok_or_else(|| failed_precondition("empty WatchRequest"))?;
     match union {
         watch_request::RequestUnion::CreateRequest(create) => {
-            handle_create(create, store, tx, active, progress_interval).await
+            handle_create(create, store, tx, active).await
         }
         watch_request::RequestUnion::CancelRequest(cancel) => {
             handle_cancel(cancel, store, tx).await
@@ -171,7 +179,6 @@ async fn handle_create(
     store: &Arc<Store>,
     tx: &mpsc::Sender<Result<WatchResponse, Status>>,
     active: &Arc<parking_lot::Mutex<Vec<i64>>>,
-    progress_interval: Duration,
 ) -> Result<(), Status> {
     let key = Bytes::from(create.key);
     let range_end = Bytes::from(create.range_end);
@@ -232,19 +239,27 @@ async fn handle_create(
         key.clone(),
         range_end.clone(),
         prev_kv,
+        create.progress_notify,
         watch_tx.clone(),
         start_revision > 0,
     );
     active.lock().push(watch_id);
 
-    tx.send(Ok(WatchResponse {
-        header: header(store.current_rev() as i64),
-        watch_id,
-        created: true,
-        ..Default::default()
-    }))
-    .await
-    .map_err(|e| Status::internal(e.to_string()))?;
+    if tx
+        .send(Ok(WatchResponse {
+            header: header(store.current_rev() as i64),
+            watch_id,
+            created: true,
+            ..Default::default()
+        }))
+        .await
+        .is_err()
+    {
+        // The client is gone: unregister the watch so its channel closes
+        // and the forwarding task below terminates.
+        store.remove_watch(watch_id);
+        return Ok(());
+    }
 
     for m in history {
         if (m.rev as i64) < start_revision {
@@ -256,37 +271,19 @@ async fn handle_create(
         let ev = WatchEvent::from_mutation(m, prev_kv);
         let resp = ev_to_response(&ev, watch_id);
         if tx.send(Ok(resp)).await.is_err() {
-            break;
+            store.remove_watch(watch_id);
+            return Ok(());
         }
     }
-
-    // The client asked for periodic progress notifications (`progress_notify`).
-    let progress_tx = watch_tx.clone();
-    let progress_store = store.clone();
-    tokio::spawn(async move {
-        if !create.progress_notify {
-            return;
-        }
-        let mut ticker = tokio::time::interval(progress_interval);
-        // The first tick of an interval completes immediately, drop it so
-        // the notification is not sent right after the creation response.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let msg = WatchMessage::Progress {
-                rev: progress_store.current_rev(),
-            };
-            if progress_tx.send(msg).is_err() {
-                // The watch is gone.
-                break;
-            }
-        }
-    });
 
     let tx2 = tx.clone();
     let active2 = active.clone();
     let store2 = store.clone();
     tokio::spawn(async move {
+        // The channel closes when the store drops the watch's sender, i.e.
+        // when the watch is cancelled or the client stream ends. That is
+        // the only exit condition: it needs no extra bookkeeping and it
+        // cannot leave a task behind.
         while let Some(msg) = watch_rx.recv().await {
             let resp = match msg {
                 WatchMessage::Event(ev) => ev_to_response(&ev, watch_id),
@@ -297,8 +294,7 @@ async fn handle_create(
                 },
             };
             if tx2.send(Ok(resp)).await.is_err() {
-                let mut g = store2.watches.lock();
-                g.remove(&watch_id);
+                store2.remove_watch(watch_id);
                 let mut a = active2.lock();
                 a.retain(|x| *x != watch_id);
                 break;
@@ -315,10 +311,10 @@ async fn handle_cancel(
     tx: &mpsc::Sender<Result<WatchResponse, Status>>,
 ) -> Result<(), Status> {
     let id = cancel.watch_id;
-    {
-        let mut g = store.watches.lock();
-        g.remove(&id);
-    }
+    // Removing the watch drops the store's sender half of its channel,
+    // which closes it: the task forwarding the watch's events to the
+    // client then returns instead of waiting forever.
+    store.remove_watch(id);
     tx.send(Ok(WatchResponse {
         header: header(store.current_rev() as i64),
         watch_id: id,

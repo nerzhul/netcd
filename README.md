@@ -14,7 +14,9 @@ Wire-compatible with `kube-apiserver` (`--etcd-servers=https://netcd:2379`).
   `kube-apiserver`'s opportunistic calls don't break the apiserver.
 - **In-memory, no Raft, no disk persistence** for KV state.
 - **Server-side TTL cap** that silently clamps any lease TTL above
-  `server_max_ttl_seconds`.
+  `server_max_ttl_seconds`. The clamped value is what the lease is
+  *renewed* with, so a client asking for less than the cap gets exactly
+  the lifetime it asked for (see [Lease TTL semantics](#lease-ttl-semantics)).
 - **Bounded cache by bytes** (`key.len() + value.len()`); FIFO eviction by
   insertion order, not LRU.
 - **Multi-tenant mTLS RBAC**: client cert SHA-256 → tenant → allowed key
@@ -163,6 +165,29 @@ notification and has to re-list. Size `history_capacity` accordingly: it
 bounds how far behind a watcher may fall before it is compacted, and every
 entry keeps a copy of the key and of the value in memory.
 
+### Lease TTL semantics
+
+`server_max_ttl_seconds` is a **cap**, not a replacement. A lease keeps
+the TTL it was granted with:
+
+- `Lease.Grant` clamps the requested TTL to the cap and stores the
+  clamped value on the lease.
+- `Lease.KeepAlive` renews the lease with **that stored value**, not with
+  the cap. A lease granted for 60 s therefore lives 60 s past its last
+  renewal, exactly like on etcd — the cap only prevents a client from
+  asking for *more* than the server allows.
+- `Lease.TimeToLive` reports `granted_ttl` = the stored value and `ttl` =
+  the remaining seconds (rounded up).
+
+This matters for the kube-apiserver, which grants short leases for the
+objects it writes and renews them itself: those objects must die shortly
+after the apiserver stops renewing, not a full day later.
+
+Leases are reaped by a background task that scans the table every second,
+so a lease is removed within ~1 s of its deadline. `Lease.Grant` with an
+explicit id that is already taken is rejected with `AlreadyExists`, like
+etcd.
+
 ### Progress notifications
 
 netcd issues **one global revision** per mutation, while the
@@ -255,6 +280,13 @@ size is immutable for the life of the process. Changing the value at
 runtime (via `PUT /v1/config`, `SIGHUP`, or a config edit) is
 persisted and will take effect on the **next** process start.
 
+The same holds for `server_max_ttl_seconds` and `max_cache_bytes`: the
+lease TTL cap is handed to the `Lease` service as an immutable value at
+boot, and the cache ceiling is read by the store at boot. A live reload
+persists them but does not apply them. `history_capacity` (the watch
+history ring buffer) and the `tenants[]` RBAC list are the only knobs a
+reload actually changes on the running process.
+
 ### RBAC is intentionally outside the override layer
 
 The `tenants[]` array (and every `Tenant` field) has **no** CLI flag and
@@ -292,8 +324,8 @@ curl -X POST http://localhost:2378/v1/config/reload
 | `kv`              | `parking_lot::RwLock<BTreeMap>`   | Cheap reads                             |
 | `eviction`        | `Mutex<VecDeque>`                 | FIFO of `(key, size, rev)`              |
 | `history`         | `Mutex<VecDeque<Mutation>>`       | Bounded ring for late Watch joiners     |
-| `leases`          | `Mutex<HashMap<i64, LeaseEntry>>` | + background expiry task                 |
-| `watches`         | `Mutex<HashMap<i64, WatchHandle>>`| Per-stream mpsc sender                  |
+| `leases`          | `Mutex<HashMap<i64, LeaseEntry>>` | + background expiry task (1 s tick)     |
+| `watches`         | `Mutex<HashMap<i64, WatchHandle>>`| Per-stream mpsc sender (store owns it)  |
 | `rev`             | `AtomicU64`                       | Monotonic revision counter              |
 | `bytes_used`      | `AtomicU64`                       | Sum of `key.len() + value.len()`        |
 | Config            | `arc_swap::ArcSwap<Config>`       | Lock-free reads, hot-reloadable         |
@@ -304,7 +336,7 @@ return `Result<T, tonic::Status>` without allocation on success.
 ## Testing
 
 ```bash
-cargo test              # 27 unit tests + 9 e2e integration tests + 5 build contract tests
+cargo test              # 41 unit tests + 17 e2e integration tests + 5 build contract tests
 cargo test --release    # slower to compile, faster to run
 ```
 

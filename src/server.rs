@@ -45,9 +45,17 @@ pub async fn build_and_serve(
     opts: EtcdServerOptions,
 ) -> anyhow::Result<()> {
     let kv_svc = KvService::new(store.clone(), auth.clone());
-    let watch_svc = WatchService::new(store.clone(), auth.clone(), progress_interval);
+    let watch_svc = WatchService::new(store.clone(), auth.clone());
     let lease_svc = LeaseService::new(store.clone(), auth.clone(), max_ttl);
     let maintenance_svc = MaintenanceService::new(store.clone());
+
+    // Background tasks that belong to the store, spawned here so that
+    // every server instance - including the one the integration tests
+    // build - gets them. The lease reaper must run for leases to expire
+    // at all, and the progress loop must run for the apiserver's watch
+    // caches to be refreshed.
+    crate::store::lease::spawn_expiry_loop(store.clone(), crate::store::lease::DEFAULT_EXPIRY_TICK);
+    crate::services::watch::spawn_progress_loop(store.clone(), progress_interval);
 
     let current_rev = Arc::new(std::sync::atomic::AtomicU64::new(1));
     {

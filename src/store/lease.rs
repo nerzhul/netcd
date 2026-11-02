@@ -4,6 +4,12 @@
 //! extends its expiry; `Revoke` deletes the lease and removes all
 //! attached keys. A background tokio task expires leases whose deadline
 //! has passed and fires `Delete` Watch events for every attached key.
+//!
+//! A lease remembers the TTL it was granted with, and every renewal
+//! uses that value. Renewing with the server-wide cap instead would
+//! silently turn every short-lived lease into a long-lived one: an
+//! apiserver asking for a 60 s lease would get a 24 h one, and the
+//! objects bound to it would never be reaped.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,17 +21,44 @@ use tokio::time::{interval, MissedTickBehavior};
 use crate::store::{MutationKind, Store};
 use bytes::Bytes;
 
+/// How often the background task scans the lease table for expired
+/// leases.
+///
+/// etcd reaps leases every 500 ms. netcd used to derive the interval
+/// from `server_max_ttl_seconds / 100`, which with the default 24 h
+/// cap meant one scan every 864 s: a lease granted for 60 s could then
+/// stay alive for a quarter of an hour. The scan is O(number of
+/// leases), so a short interval is cheap and keeps the observed
+/// lifetime close to the granted one.
+pub const DEFAULT_EXPIRY_TICK: Duration = Duration::from_secs(1);
+
 /// One active lease.
 #[derive(Debug)]
 pub struct LeaseEntry {
     pub id: i64,
     pub expires: Instant,
+    /// TTL this lease was granted with, already clamped to the server
+    /// cap. Renewals extend the deadline by this much, so the client
+    /// gets the lifetime it asked for.
+    pub ttl: Duration,
     /// Keys attached to this lease. We snapshot this set when the
     /// lease expires or is revoked; under the table lock a concurrent
     /// Put can be adding new attachments.
     pub keys: HashSet<Bytes>,
     /// Optional owner tenant name (used for ACL on KeepAlive / Revoke).
     pub owner: Option<String>,
+}
+
+/// Snapshot of a lease's state, as reported by `Lease.TimeToLive`.
+#[derive(Debug)]
+pub struct LeaseStatus {
+    pub id: i64,
+    /// Time left before the lease expires.
+    pub remaining: Duration,
+    /// TTL the lease was granted with (already clamped to the cap).
+    pub granted_ttl: Duration,
+    /// Keys currently attached to the lease.
+    pub keys: HashSet<Bytes>,
 }
 
 #[derive(Debug, Default)]
@@ -61,6 +94,7 @@ impl LeaseTable {
             LeaseEntry {
                 id,
                 expires: Instant::now() + ttl,
+                ttl,
                 keys: HashSet::new(),
                 owner,
             },
@@ -73,19 +107,24 @@ impl LeaseTable {
         }
     }
 
-    pub fn keep_alive(&self, id: i64, ttl: Duration, owner: Option<&str>) -> bool {
+    /// Renew `id`.
+    ///
+    /// The deadline is extended by the TTL the lease was *granted*
+    /// with, not by the server-wide cap: honouring the TTL the client
+    /// asked for is the whole point of a lease. Returns the time left
+    /// after the renewal, or `None` when the lease is unknown or
+    /// owned by another tenant.
+    pub fn keep_alive(&self, id: i64, owner: Option<&str>) -> Option<Duration> {
         let mut g = self.inner.lock();
-        if let Some(l) = g.get_mut(&id) {
-            if let Some(o) = owner {
-                if l.owner.as_deref().is_some_and(|x| x != o) {
-                    return false;
-                }
+        let l = g.get_mut(&id)?;
+        if let Some(o) = owner {
+            if l.owner.as_deref().is_some_and(|x| x != o) {
+                return None;
             }
-            l.expires = Instant::now() + ttl;
-            true
-        } else {
-            false
         }
+        let now = Instant::now();
+        l.expires = now + l.ttl;
+        Some(l.expires - now)
     }
 
     pub fn revoke(&self, id: i64, owner: Option<&str>) -> Option<HashSet<Bytes>> {
@@ -123,16 +162,16 @@ impl LeaseTable {
         touched
     }
 
-    pub fn time_to_live(&self, id: i64) -> Option<(i64, Duration, HashSet<Bytes>)> {
+    /// Snapshot a lease's state. `None` when the lease is unknown.
+    pub fn time_to_live(&self, id: i64) -> Option<LeaseStatus> {
         let g = self.inner.lock();
-        g.get(&id).map(|l| {
-            let now = Instant::now();
-            let rem = if l.expires > now {
-                l.expires - now
-            } else {
-                Duration::ZERO
-            };
-            (l.id, rem, l.keys.clone())
+        let l = g.get(&id)?;
+        let remaining = l.expires.saturating_duration_since(Instant::now());
+        Some(LeaseStatus {
+            id: l.id,
+            remaining,
+            granted_ttl: l.ttl,
+            keys: l.keys.clone(),
         })
     }
 
@@ -193,9 +232,48 @@ mod tests {
         let lt = LeaseTable::new();
         let id = lt.grant(Duration::from_secs(60), None);
         assert!(id > 0);
-        assert!(lt.keep_alive(id, Duration::from_secs(120), None));
+        assert!(lt.keep_alive(id, None).is_some());
         let keys = lt.revoke(id, None).unwrap();
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn keep_alive_renews_with_the_granted_ttl() {
+        // Regression: `keep_alive` used to take the TTL from its caller,
+        // and the only caller passed the server-wide cap. A lease the
+        // apiserver granted for 60 s was therefore renewed for the
+        // full cap (24 h by default) and never expired.
+        let lt = LeaseTable::new();
+        let granted = Duration::from_secs(60);
+        let id = lt.grant(granted, None);
+
+        let remaining = lt.keep_alive(id, None).expect("the lease is alive");
+        assert!(
+            remaining <= granted && remaining > granted - Duration::from_secs(1),
+            "the renewal must use the granted TTL ({granted:?}), got {remaining:?}",
+        );
+
+        let status = lt.time_to_live(id).expect("the lease exists");
+        assert_eq!(status.granted_ttl, granted);
+        assert!(
+            status.remaining <= granted && status.remaining > granted - Duration::from_secs(1),
+            "the remaining TTL must follow the granted TTL, got {:?}",
+            status.remaining,
+        );
+    }
+
+    #[test]
+    fn keep_alive_on_an_unknown_lease_is_none() {
+        let lt = LeaseTable::new();
+        assert!(lt.keep_alive(42, None).is_none());
+    }
+
+    #[test]
+    fn keep_alive_refuses_another_tenant() {
+        let lt = LeaseTable::new();
+        let id = lt.grant(Duration::from_secs(60), Some("alice".into()));
+        assert!(lt.keep_alive(id, Some("bob")).is_none());
+        assert!(lt.keep_alive(id, Some("alice")).is_some());
     }
 
     #[test]

@@ -40,6 +40,18 @@ fn header(rev: i64) -> Option<etcdserverpb::ResponseHeader> {
     })
 }
 
+/// Round a duration up to whole seconds, the way etcd reports lease
+/// TTLs. Truncating would report 59 s for a lease that still has
+/// 59.9 s left.
+fn ceil_secs(d: Duration) -> i64 {
+    let secs = d.as_secs();
+    if d.subsec_nanos() > 0 {
+        secs as i64 + 1
+    } else {
+        secs as i64
+    }
+}
+
 #[tonic::async_trait]
 impl etcdserverpb::lease_server::Lease for LeaseService {
     type LeaseKeepAliveStream =
@@ -56,13 +68,18 @@ impl etcdserverpb::lease_server::Lease for LeaseService {
         let ttl = Duration::from_secs(clamped as u64);
         let owner = Some(id.tenant.name.clone());
         let lid = if req.id > 0 {
-            // Honour requested id if free.
+            // Honour the requested id when it is free. etcd rejects a
+            // taken id with `AlreadyExists`; silently handing it back
+            // would give the caller a lease it does not own, carrying
+            // someone else's TTL.
             if self.store.leases.time_to_live(req.id).is_some() {
-                req.id
-            } else {
-                self.store.leases.grant_with_id(req.id, ttl, owner);
-                req.id
+                return Err(Status::new(
+                    tonic::Code::AlreadyExists,
+                    format!("lease {} already exists", req.id),
+                ));
             }
+            self.store.leases.grant_with_id(req.id, ttl, owner);
+            req.id
         } else {
             self.store.leases.grant(ttl, owner)
         };
@@ -101,7 +118,6 @@ impl etcdserverpb::lease_server::Lease for LeaseService {
         let mut in_stream = request.into_inner();
         let (tx, rx) = mpsc::channel::<Result<LeaseKeepAliveResponse, Status>>(64);
         let store = self.store.clone();
-        let max_ttl = self.max_ttl;
         tokio::spawn(async move {
             while let Some(req) = match in_stream.message().await {
                 Ok(m) => m,
@@ -110,13 +126,19 @@ impl etcdserverpb::lease_server::Lease for LeaseService {
                     None
                 }
             } {
-                // KeepAliveRequest has no `ttl` field - we use the
-                // lease's original (max) TTL each call.
-                let ok = store.leases.keep_alive(req.id, max_ttl, None);
+                // `LeaseKeepAliveRequest` carries no TTL: the lease is
+                // renewed with the TTL it was granted with (already
+                // clamped to the server cap at grant time). Renewing
+                // with the server cap instead turned every 60 s lease
+                // into a 24 h one, so the objects bound to it were
+                // never reaped.
+                let remaining = store.leases.keep_alive(req.id, None);
                 let resp = LeaseKeepAliveResponse {
                     header: header(store.current_rev() as i64),
                     id: req.id,
-                    ttl: if ok { max_ttl.as_secs() as i64 } else { 0 },
+                    // etcd reports the time left before the lease
+                    // expires, not the cap.
+                    ttl: remaining.map(ceil_secs).unwrap_or(0),
                 };
                 if tx.send(Ok(resp)).await.is_err() {
                     break;
@@ -150,26 +172,104 @@ impl etcdserverpb::lease_server::Lease for LeaseService {
         request: Request<LeaseTimeToLiveRequest>,
     ) -> Result<Response<LeaseTimeToLiveResponse>, Status> {
         let req = request.into_inner();
-        let out = self.store.leases.time_to_live(req.id);
-        let (_id, rem, keys) = match out {
-            Some(v) => v,
-            None => {
-                return Err(Status::new(
-                    tonic::Code::NotFound,
-                    format!("lease {} not found", req.id),
-                ));
-            }
-        };
+        let status = self.store.leases.time_to_live(req.id).ok_or_else(|| {
+            Status::new(tonic::Code::NotFound, format!("lease {} not found", req.id))
+        })?;
         Ok(Response::new(LeaseTimeToLiveResponse {
             header: header(self.store.current_rev() as i64),
-            id: req.id,
-            ttl: rem.as_secs() as i64,
-            granted_ttl: self.max_ttl.as_secs() as i64,
+            id: status.id,
+            ttl: ceil_secs(status.remaining),
+            granted_ttl: status.granted_ttl.as_secs() as i64,
             keys: if req.keys {
-                keys.iter().map(|b| b.to_vec()).collect()
+                status.keys.iter().map(|b| b.to_vec()).collect()
             } else {
                 Vec::new()
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::proto::etcdserverpb::lease_server::Lease;
+    use arc_swap::ArcSwap;
+
+    fn service(max_ttl: Duration) -> LeaseService {
+        let store = Store::new(1024 * 1024, 100);
+        let cfg = Arc::new(ArcSwap::from_pointee(Config::default_dev()));
+        let auth = Authenticator::new(cfg, false);
+        LeaseService::new(store, auth, max_ttl)
+    }
+
+    #[tokio::test]
+    async fn grant_clamps_the_ttl_to_the_server_cap() {
+        let svc = service(Duration::from_secs(60));
+        let resp = svc
+            .lease_grant(Request::new(LeaseGrantRequest { ttl: 3600, id: 0 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.ttl, 60, "the TTL must be clamped to the cap");
+    }
+
+    #[tokio::test]
+    async fn grant_keeps_a_ttl_below_the_cap() {
+        let svc = service(Duration::from_secs(3600));
+        let resp = svc
+            .lease_grant(Request::new(LeaseGrantRequest { ttl: 60, id: 0 }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.ttl, 60, "a TTL below the cap must be honoured");
+    }
+
+    #[tokio::test]
+    async fn time_to_live_reports_the_granted_ttl_not_the_cap() {
+        // Regression: `granted_ttl` used to report the server-wide cap,
+        // so a client could not tell what lifetime its lease actually
+        // had.
+        let svc = service(Duration::from_secs(3600));
+        let id = svc
+            .lease_grant(Request::new(LeaseGrantRequest { ttl: 60, id: 0 }))
+            .await
+            .unwrap()
+            .into_inner()
+            .id;
+
+        let resp = svc
+            .lease_time_to_live(Request::new(LeaseTimeToLiveRequest { id, keys: false }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.granted_ttl, 60);
+        assert!(
+            resp.ttl > 0 && resp.ttl <= 60,
+            "the remaining TTL must follow the granted TTL, got {}",
+            resp.ttl,
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_with_a_taken_id_is_rejected() {
+        // Regression: a taken id used to be handed back with a success
+        // response, giving the caller a lease it did not own.
+        let svc = service(Duration::from_secs(60));
+        svc.lease_grant(Request::new(LeaseGrantRequest { ttl: 60, id: 7 }))
+            .await
+            .unwrap();
+        let err = svc
+            .lease_grant(Request::new(LeaseGrantRequest { ttl: 60, id: 7 }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[test]
+    fn ceil_secs_rounds_up() {
+        assert_eq!(ceil_secs(Duration::from_secs(60)), 60);
+        assert_eq!(ceil_secs(Duration::from_millis(59_999)), 60);
+        assert_eq!(ceil_secs(Duration::ZERO), 0);
     }
 }

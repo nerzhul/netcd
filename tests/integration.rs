@@ -22,9 +22,11 @@ fn init() {
 use netcd::auth::Authenticator;
 use netcd::config::{Config, Tenant};
 use netcd::proto::etcdserverpb::kv_client::KvClient;
+use netcd::proto::etcdserverpb::lease_client::LeaseClient;
 use netcd::proto::etcdserverpb::watch_client::WatchClient;
 use netcd::proto::etcdserverpb::{
-    DeleteRangeRequest, PutRequest, RangeRequest, RequestProgressRequest, TxnRequest,
+    DeleteRangeRequest, LeaseGrantRequest, LeaseKeepAliveRequest, LeaseTimeToLiveRequest,
+    PutRequest, RangeRequest, RequestProgressRequest, TxnRequest, WatchCancelRequest,
     WatchCreateRequest, WatchRequest,
 };
 use netcd::server::{build_and_serve, EtcdServerOptions};
@@ -104,6 +106,11 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with_max_ttl(Duration::from_secs(60)).await
+    }
+
+    /// Start a server whose lease TTL cap is `max_ttl`.
+    async fn start_with_max_ttl(max_ttl: Duration) -> Self {
         init();
         let (ca_pem, server_cert_pem, server_key_pem, client_cert_pem, client_key_pem) =
             build_pki();
@@ -143,7 +150,7 @@ impl Harness {
             let _ = build_and_serve(
                 store,
                 auth,
-                Duration::from_secs(60),
+                max_ttl,
                 100,
                 // Short progress notification interval so the periodic
                 // notifications are observable in a test.
@@ -187,6 +194,11 @@ impl Harness {
     async fn watch_client(&self) -> WatchClient<Channel> {
         let ch = self.endpoint().connect().await.unwrap();
         WatchClient::new(ch)
+    }
+
+    async fn lease_client(&self) -> LeaseClient<Channel> {
+        let ch = self.endpoint().connect().await.unwrap();
+        LeaseClient::new(ch)
     }
 
     async fn stop(mut self) {
@@ -960,6 +972,286 @@ async fn periodic_progress_notification_is_sent_to_progress_notify_watchers() {
     assert!(
         notified,
         "expected a periodic progress notification for a progress_notify watcher",
+    );
+
+    h.stop().await;
+}
+
+/// A lease must expire once its TTL has elapsed, and the keys bound to
+/// it must be reaped.
+///
+/// Regression: the lease expiry loop ran every `server_max_ttl_seconds
+/// / 100` (864 s with the default 24 h cap), so a short lease stayed
+/// alive for a quarter of an hour.
+#[tokio::test]
+async fn a_lease_expires_and_reaps_its_keys() {
+    let h = Harness::start_with_max_ttl(Duration::from_secs(2)).await;
+    let mut kv = h.kv_client().await;
+    let mut lease = h.lease_client().await;
+
+    let id = lease
+        .lease_grant(LeaseGrantRequest { ttl: 2, id: 0 })
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    kv.put(PutRequest {
+        key: b"/registry/events/team-a/short-lived".to_vec(),
+        value: b"payload".to_vec(),
+        lease: id,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // The key is there right away.
+    let got = kv
+        .range(RangeRequest {
+            key: b"/registry/events/team-a/short-lived".to_vec(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(got.count, 1, "the key must be readable before the TTL");
+
+    // ... and gone a few seconds later.
+    let mut gone = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let got = kv
+            .range(RangeRequest {
+                key: b"/registry/events/team-a/short-lived".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        if got.count == 0 {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "the key must be reaped when its lease expires",);
+
+    h.stop().await;
+}
+
+/// A `KeepAlive` must renew the lease with the TTL the client was
+/// granted, not with the server's cap.
+///
+/// Regression: the renewal used the server-wide cap, so a lease granted
+/// for 2 s was renewed for the whole cap and the objects bound to it
+/// were never reaped.
+#[tokio::test]
+async fn keep_alive_does_not_extend_the_lease_beyond_its_granted_ttl() {
+    let h = Harness::start_with_max_ttl(Duration::from_secs(2)).await;
+    let mut kv = h.kv_client().await;
+    let mut lease = h.lease_client().await;
+
+    let id = lease
+        .lease_grant(LeaseGrantRequest { ttl: 2, id: 0 })
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    kv.put(PutRequest {
+        key: b"/registry/events/team-a/kept-alive".to_vec(),
+        value: b"payload".to_vec(),
+        lease: id,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+
+    // Keep the lease alive for longer than its TTL. With the old code
+    // each renewal pushed the deadline to the server cap; with the fix
+    // the deadline stays at `now + granted_ttl`.
+    let (tx, rx) = futures::channel::mpsc::unbounded::<LeaseKeepAliveRequest>();
+    let mut keepalive = lease.lease_keep_alive(rx).await.unwrap().into_inner();
+    for _ in 0..5 {
+        tx.unbounded_send(LeaseKeepAliveRequest { id }).unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(2), keepalive.next())
+            .await
+            .expect("a keepalive response")
+            .expect("the stream stays open")
+            .expect("no error");
+        assert!(
+            resp.ttl > 0 && resp.ttl <= 2,
+            "the keepalive must report the remaining TTL of a 2 s lease, got {}",
+            resp.ttl,
+        );
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    drop(tx);
+
+    // The lease was kept alive for ~3 s, well past its 2 s TTL, but it
+    // was never renewed past `now + 2 s`, so the key must now be gone.
+    let mut gone = false;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let got = kv
+            .range(RangeRequest {
+                key: b"/registry/events/team-a/kept-alive".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        if got.count == 0 {
+            gone = true;
+            break;
+        }
+    }
+    assert!(
+        gone,
+        "a keepalive must not turn a 2 s lease into a server-cap lease",
+    );
+
+    h.stop().await;
+}
+
+/// The TTL cap from the config is a hard ceiling: it bounds the lease at
+/// grant time *and* every renewal.
+///
+/// `LeaseKeepAliveRequest` carries no TTL field, so a client cannot ask for
+/// a longer lease on a renewal: the only TTL that can ever apply to a lease
+/// is the one decided at grant time, and that one is capped.
+#[tokio::test]
+async fn the_ttl_cap_bounds_grants_and_renewals() {
+    let h = Harness::start_with_max_ttl(Duration::from_secs(600)).await;
+    let mut lease = h.lease_client().await;
+
+    // A lease granted below the cap keeps that shorter TTL.
+    let short = lease
+        .lease_grant(LeaseGrantRequest { ttl: 30, id: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(short.ttl, 30, "a TTL below the cap must be granted as is");
+
+    // A lease granted above the cap is clamped to the cap.
+    let long = lease
+        .lease_grant(LeaseGrantRequest { ttl: 86_400, id: 0 })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(long.ttl, 600, "the grant must be clamped to the cap");
+
+    let (tx, rx) = futures::channel::mpsc::unbounded::<LeaseKeepAliveRequest>();
+    let mut keepalive = lease.lease_keep_alive(rx).await.unwrap().into_inner();
+
+    // Renewing never pushes a lease past its granted (capped) TTL, however
+    // many times the client renews.
+    for round in 0..3 {
+        for (id, granted) in [(short.id, 30i64), (long.id, 600i64)] {
+            tx.unbounded_send(LeaseKeepAliveRequest { id }).unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(2), keepalive.next())
+                .await
+                .expect("a keepalive response")
+                .expect("the stream stays open")
+                .expect("no error");
+            assert!(
+                resp.ttl > 0 && resp.ttl <= granted,
+                "round {round}: lease {id} must be renewed with at most {granted}s, got {}",
+                resp.ttl,
+            );
+        }
+    }
+
+    drop(tx);
+    h.stop().await;
+}
+
+/// `Lease.TimeToLive` must report the TTL the lease was granted with.
+#[tokio::test]
+async fn time_to_live_reports_the_granted_ttl() {
+    let h = Harness::start_with_max_ttl(Duration::from_secs(600)).await;
+    let mut lease = h.lease_client().await;
+
+    let id = lease
+        .lease_grant(LeaseGrantRequest { ttl: 30, id: 0 })
+        .await
+        .unwrap()
+        .into_inner()
+        .id;
+    let resp = lease
+        .lease_time_to_live(LeaseTimeToLiveRequest { id, keys: false })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        resp.granted_ttl, 30,
+        "granted_ttl must be the TTL the client asked for",
+    );
+    assert!(
+        resp.ttl > 0 && resp.ttl <= 30,
+        "the remaining TTL must follow the granted TTL, got {}",
+        resp.ttl,
+    );
+
+    h.stop().await;
+}
+
+/// A cancelled watch must stop receiving notifications.
+///
+/// Regression: each watch used to run its own progress-notification
+/// ticker, and the ticker held a clone of the watch's sender. Removing
+/// the watch from the store therefore did not close its channel: the
+/// ticker kept queueing notifications nobody read and the task
+/// forwarding them never returned.
+#[tokio::test]
+async fn a_cancelled_watch_stops_receiving_notifications() {
+    let h = Harness::start().await;
+    let mut w = h.watch_client().await;
+    let (tx, rx) = futures::channel::mpsc::unbounded::<WatchRequest>();
+    tx.unbounded_send(WatchRequest {
+        request_union: Some(
+            netcd::proto::etcdserverpb::watch_request::RequestUnion::CreateRequest(
+                WatchCreateRequest {
+                    key: b"/registry/events/team-a/".to_vec(),
+                    range_end: b"\x00".to_vec(),
+                    progress_notify: true,
+                    ..Default::default()
+                },
+            ),
+        ),
+    })
+    .unwrap();
+    let mut stream = w.watch(rx).await.unwrap().into_inner();
+
+    // The create response.
+    let created = stream.next().await.expect("create response").unwrap();
+    assert!(created.created, "expected the create response");
+    let watch_id = created.watch_id;
+
+    // Cancel the watch. A progress notification may be interleaved
+    // with the cancel response, so loop until it shows up.
+    tx.unbounded_send(WatchRequest {
+        request_union: Some(
+            netcd::proto::etcdserverpb::watch_request::RequestUnion::CancelRequest(
+                WatchCancelRequest { watch_id },
+            ),
+        ),
+    })
+    .unwrap();
+    let mut canceled = false;
+    while !canceled {
+        let resp = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("the cancel response")
+            .expect("the stream stays open")
+            .expect("no error");
+        canceled = resp.canceled;
+    }
+
+    // At most one notification may have been queued when the cancel was
+    // processed; nothing must follow it.
+    let _ = tokio::time::timeout(Duration::from_millis(700), stream.next()).await;
+    let extra = tokio::time::timeout(Duration::from_millis(1500), stream.next()).await;
+    assert!(
+        extra.is_err(),
+        "a cancelled watch must stop receiving notifications, got {extra:?}",
     );
 
     h.stop().await;

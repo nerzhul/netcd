@@ -262,14 +262,9 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
     let cfg_arcswap: Arc<ArcSwap<Config>> = Arc::new(ArcSwap::from_pointee(config.clone()));
     let auth = Authenticator::new(cfg_arcswap.clone(), cli.mtls);
 
-    // Spawn background tasks: lease expiry, history trim, SIGHUP reload.
-    let lease_tick = {
-        let ttl_secs = config.server_max_ttl_seconds.max(1) as u64;
-        Duration::from_secs((ttl_secs / 100).max(1))
-    };
-    netcd::store::lease::spawn_expiry_loop(store.clone(), lease_tick);
-
-    // SIGHUP -> reload config from disk and update live state.
+    // Spawn background tasks: SIGHUP reload. The lease expiry loop and
+    // the progress-notification loop are spawned by `build_and_serve`,
+    // next to the server they belong to.
     {
         let cfg_ref_signal = cfg_ref.clone();
         let store_signal = store.clone();

@@ -67,7 +67,13 @@ pub struct WatchHandle {
     pub range_end: Bytes,
     /// `prev_kv` requested?
     pub prev_kv: bool,
+    /// Did the client ask for periodic progress notifications?
+    pub progress_notify: bool,
     /// Sender half of the event channel. Cloning is cheap (mpsc).
+    ///
+    /// This is the **only** sender of the watch's channel: the store
+    /// owns it, so dropping the handle closes the channel and the
+    /// task forwarding it to the client terminates.
     pub sender: tokio::sync::mpsc::UnboundedSender<WatchMessage>,
 }
 
@@ -143,6 +149,7 @@ impl Store {
         key: Bytes,
         range_end: Bytes,
         prev_kv: bool,
+        progress_notify: bool,
         sender: tokio::sync::mpsc::UnboundedSender<WatchMessage>,
         with_history: bool,
     ) -> (i64, Vec<Mutation>) {
@@ -160,10 +167,22 @@ impl Store {
                 key,
                 range_end,
                 prev_kv,
+                progress_notify,
                 sender,
             },
         );
         (watch_id, history)
+    }
+
+    /// Unregister a watch.
+    ///
+    /// Dropping the handle drops the store's sender half of the watch's
+    /// channel, which closes it: the task forwarding events to the client
+    /// then sees the channel close and terminates. A watch that is only
+    /// removed from the map but keeps a sender alive somewhere else would
+    /// leak both the task and the messages queued in the channel.
+    pub fn remove_watch(&self, id: i64) -> Option<WatchHandle> {
+        self.watches.lock().remove(&id)
     }
 
     /// Snapshot the current revision.
@@ -506,6 +525,30 @@ impl Store {
         }
         rev
     }
+
+    /// Send a progress notification to the watchers that asked for them
+    /// (`progress_notify = true`) and return how many were notified.
+    ///
+    /// The periodic notifications come from a single background task
+    /// instead of one ticker per watch. A per-watch ticker had to hold
+    /// its own clone of the watch's sender, which kept the channel open
+    /// after the watch was cancelled: the ticker kept pushing
+    /// notifications into an unbounded queue nobody read, and the task
+    /// forwarding them to the client never returned.
+    pub fn broadcast_progress_to_notified(&self) -> usize {
+        let rev = self.current_rev();
+        let g = self.watches.lock();
+        let mut notified = 0;
+        for w in g.values() {
+            if !w.progress_notify {
+                continue;
+            }
+            if w.sender.send(WatchMessage::Progress { rev }).is_ok() {
+                notified += 1;
+            }
+        }
+        notified
+    }
 }
 
 /// Check whether `key` falls within the `[w.key, w.range_end)` range
@@ -733,6 +776,7 @@ mod tests {
             Bytes::from_static(b"/"),
             Bytes::from_static(b"\x00"),
             false,
+            false,
             tx,
             false,
         );
@@ -746,6 +790,70 @@ mod tests {
     }
 
     #[test]
+    fn periodic_progress_only_reaches_notify_watchers() {
+        // The periodic notifications are pushed by one server-wide task,
+        // which needs to tell the watchers that asked for them apart from
+        // the ones that did not.
+        let s = Store::new(1024, 100);
+        let (tx_plain, mut rx_plain) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_notify, mut rx_notify) = tokio::sync::mpsc::unbounded_channel();
+        s.register_watch(
+            Bytes::from_static(b"/"),
+            Bytes::from_static(b"\x00"),
+            false,
+            false,
+            tx_plain,
+            false,
+        );
+        s.register_watch(
+            Bytes::from_static(b"/"),
+            Bytes::from_static(b"\x00"),
+            false,
+            true,
+            tx_notify,
+            false,
+        );
+
+        assert_eq!(s.broadcast_progress_to_notified(), 1);
+        assert!(
+            rx_plain.try_recv().is_err(),
+            "a watcher that did not ask for notifications must not get one",
+        );
+        assert!(
+            matches!(rx_notify.try_recv(), Ok(WatchMessage::Progress { .. })),
+            "a progress_notify watcher must get one",
+        );
+    }
+
+    #[test]
+    fn removing_a_watch_closes_its_channel() {
+        // Regression: the per-watch progress ticker held a clone of the
+        // watch's sender, so removing the watch from the map did not
+        // close the channel: the forwarding task waited forever and the
+        // ticker kept queueing notifications nobody read.
+        let s = Store::new(1024, 100);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (watch_id, _) = s.register_watch(
+            Bytes::from_static(b"/"),
+            Bytes::from_static(b"\x00"),
+            false,
+            true,
+            tx,
+            false,
+        );
+
+        assert!(s.remove_watch(watch_id).is_some());
+        assert!(
+            rx.try_recv().is_err(),
+            "the channel must be closed once the watch is gone",
+        );
+        assert!(
+            s.remove_watch(watch_id).is_none(),
+            "removing a watch twice must be a no-op",
+        );
+    }
+
+    #[test]
     fn watch_events_are_delivered_in_revision_order() {
         // Concurrent writers must not fan their events out out of order: the
         // apiserver's watch cache assigns its resource version from the
@@ -756,6 +864,7 @@ mod tests {
         s.register_watch(
             Bytes::from_static(b"/"),
             Bytes::from_static(b"\x00"),
+            false,
             false,
             tx,
             false,

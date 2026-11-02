@@ -265,6 +265,15 @@ curl -X PUT http://localhost:2378/v1/config \
          }'
 ```
 
+**The new cap is applied at the next process start, not immediately.**
+`server_max_ttl_seconds` is read once at boot and handed to the `Lease`
+service as an immutable value; a `SIGHUP` or a `PUT /v1/config` persists
+the new value and swaps the live `Config`, but the running server keeps
+using the cap it was started with. `max_cache_bytes` behaves the same
+way. Only `history_capacity` (the watch history ring buffer) and the
+`tenants[]` RBAC list take effect on a live reload. Restart the process
+to apply a new TTL cap or cache ceiling.
+
 ### Pre-flight: verify the live config matches disk
 
 ```bash
